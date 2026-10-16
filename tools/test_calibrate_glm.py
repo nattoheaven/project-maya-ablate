@@ -101,6 +101,54 @@ class Measure(unittest.TestCase):
         self.assertEqual(eng.requests, [])
 
 
+class DiskEngine(FakeEngine):
+    """A FakeEngine whose model does not fit VRAM and RAM (the decode reads from the SSD): its speed also depends on
+    the request's read_chunks (8 when it names none)."""
+
+    def __init__(self, speed, experts=12384, held=9000, **kw):
+        super().__init__(lambda s, t: 0.0, **kw)
+        self.speed3 = speed
+        self.info.update(experts=experts, vram_slots=held // 2, ram_slots=held - held // 2)
+        self.chunks = []
+
+    def generate(self, ids, max_new, sampling, cancel):
+        tune = sampling.get("strata_tune") or {}
+        c = tune.get("read_chunks", 8)
+        self.chunks.append(c)
+        self.speed = lambda s, t: self.speed3(s, t, c)
+        return super().generate(ids, max_new, sampling, cancel)
+
+
+class ReadChunks(unittest.TestCase):
+    def test_a_faster_read_size_is_kept(self):
+        # a Windows laptop on an Intel RST RAID (#67): 4 pieces 15% faster than the engine's 8
+        eng = DiskEngine(lambda s, t, c: 14.5 * (1.15 if c == 4 else 1.0))
+        res, _ = run_measure(eng)
+        self.assertEqual(res["settings"], {CAL.CHUNKS_ENV: "4"})
+        self.assertAlmostEqual(res["report"]["tok_s"], 16.7, places=1)
+
+    def test_fewer_pieces_slower_keeps_the_engines_own_and_stops(self):
+        # a Linux NVMe (Mercury): 8 > 4 > 2 - nothing kept, and 2 is not tried once 4 lost
+        eng = DiskEngine(lambda s, t, c: {8: 12.6, 4: 12.2, 2: 11.6}[c])
+        res, _ = run_measure(eng)
+        self.assertEqual(res["settings"], {})
+        self.assertIn(4, eng.chunks)
+        self.assertNotIn(2, eng.chunks)
+
+    def test_no_disk_no_read_size(self):
+        # every expert in VRAM or RAM: the disk reads' size is not measured
+        eng = DiskEngine(lambda s, t, c: 20.0, experts=9000, held=9000)
+        res, _ = run_measure(eng)
+        self.assertEqual(res["settings"], {})
+        self.assertEqual(set(eng.chunks), {8})
+
+    def test_reads_disk(self):
+        self.assertTrue(CAL.reads_disk({"experts": 12384, "vram_slots": 3000, "ram_slots": 5000}))
+        self.assertFalse(CAL.reads_disk({"experts": 12384, "vram_slots": 7000, "ram_slots": 6000}))
+        self.assertFalse(CAL.reads_disk({"cpu_threads": 40}))
+        self.assertFalse(CAL.reads_disk({"experts": "x", "vram_slots": 1}))
+
+
 class Helpers(unittest.TestCase):
     def test_apply_replaces_and_clears(self):
         env = {"STRATA_GLM_RAM_HEADROOM_GB": "4", CAL.SHARE_ENV: "0.50", CAL.THREADS_ENV: "12"}
@@ -131,39 +179,44 @@ class Helpers(unittest.TestCase):
             pack.mkdir()
             tmp.mkdir()
             (pack / "expert_usage.txt").write_text("3 7:12\n")
-            env = CAL.usage_copy({"args": ["--glm-pack", str(pack)]}, tmp)
-            self.assertEqual(env, {"STRATA_GLM_USAGE": str(tmp / "expert_usage.txt")})
-            self.assertEqual((tmp / "expert_usage.txt").read_text(), "3 7:12\n")
+            # no STRATA_GLM_USAGE: the engine keeps no usage file (an old pack's expert_usage.txt is not read)
+            self.assertEqual(CAL.usage_copy({"args": ["--glm-pack", str(pack)]}, tmp), {"STRATA_GLM_USAGE": "0"})
+            self.assertFalse((tmp / "expert_usage.txt").exists())
             own = Path(d) / "mine.txt"
             own.write_text("5 1:2\n")
             env = CAL.usage_copy({"args": ["--glm-pack", str(pack)], "env": {"STRATA_GLM_USAGE": str(own)}}, tmp)
+            self.assertEqual(env, {"STRATA_GLM_USAGE": str(tmp / "expert_usage.txt")})
             self.assertEqual((tmp / "expert_usage.txt").read_text(), "5 1:2\n")
             self.assertEqual(CAL.usage_copy({"env": {"STRATA_GLM_USAGE": "0"}}, tmp), {"STRATA_GLM_USAGE": "0"})
             (tmp / "expert_usage.txt").unlink()
-            env = CAL.usage_copy({"args": ["--glm-pack", str(Path(d) / "none")]}, tmp)   # no file yet: a new one
+            env = CAL.usage_copy({"env": {"STRATA_GLM_USAGE": str(Path(d) / "none.txt")}}, tmp)   # no file yet
             self.assertEqual(env, {"STRATA_GLM_USAGE": str(tmp / "expert_usage.txt")})
             self.assertFalse((tmp / "expert_usage.txt").exists())
 
     def test_run_uses_a_usage_copy(self):
         with tempfile.TemporaryDirectory() as d:
-            pack = Path(d) / "pack"
-            pack.mkdir()
-            (pack / "expert_usage.txt").write_text("3 7:12\n")
+            own = Path(d) / "mine.txt"
+            own.write_text("3 7:12\n")
+            learned = Path(d) / "learned.bin"
             seen = []
 
             def start(c):
-                seen.append(dict(c["env"]))
+                seen.append({"env": dict(c["env"]), "args": list(c["args"])})
                 return FakeEngine(lambda s, t: 18.0, threads=0)
-            cfg = {"args": ["--glm-pack", str(pack)], "env": {CAL.THREADS_ENV: "12"}}
+            cfg = {"args": ["--glm-pack", "pack", "--expert-profile", "p.bin", "--expert-profile-save", str(learned),
+                            "--expert-profile-save-every", "5", "--dump-routing", "t.bin", "--prefill", "auto"],
+                   "env": {CAL.THREADS_ENV: "12", "STRATA_GLM_USAGE": str(own)}}
             orig = CAL.prompt_ids
             CAL.prompt_ids = lambda c: [[1, 2, 3]] * 3
             try:
                 CAL.run(cfg, say=lambda *a: None, start_engine=start)
             finally:
                 CAL.prompt_ids = orig
-            self.assertNotIn(CAL.THREADS_ENV, seen[0])                              # the engine's own choice
-            self.assertNotEqual(Path(seen[0]["STRATA_GLM_USAGE"]).parent, pack)    # not the pack's own file
-            self.assertEqual((pack / "expert_usage.txt").read_text(), "3 7:12\n")
+            self.assertNotIn(CAL.THREADS_ENV, seen[0]["env"])                              # the engine's own choice
+            self.assertNotEqual(Path(seen[0]["env"]["STRATA_GLM_USAGE"]), own)            # not this PC's own file
+            self.assertEqual(own.read_text(), "3 7:12\n")
+            # the learned profile and the trace are not written; the profile it starts from stays
+            self.assertEqual(seen[0]["args"], ["--glm-pack", "pack", "--expert-profile", "p.bin", "--prefill", "auto"])
 
     def test_cpu_list(self):
         self.assertEqual(CAL.cpu_list("0-3,8,10-11\n"), [0, 1, 2, 3, 8, 10, 11])
@@ -181,6 +234,17 @@ class Helpers(unittest.TestCase):
             self.assertEqual(CAL.host_thread_extras(root, hybrid), [3])        # two sockets of 4: 4 - 1
             hybrid.write_text("0-5\n")
             self.assertEqual(CAL.host_thread_extras(root, hybrid), [3, 5])     # + a hybrid CPU's 6 P-core CPUs - 1
+
+
+class EngineError(unittest.TestCase):
+    def test_the_engine_own_last_line(self):
+        # the engine's own lines say "maya ..." (or "glm ...", "ERR ..."); without one, the log's last line
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            log.write_text("loading\nmaya generate: pack: out of memory\nsome library noise\n")
+            self.assertEqual(CAL.engine_error(str(log)), "maya generate: pack: out of memory")
+            log.write_text("only noise\n")
+            self.assertEqual(CAL.engine_error(str(log)), "only noise")
 
 
 if __name__ == "__main__":

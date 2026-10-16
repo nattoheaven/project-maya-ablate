@@ -22,7 +22,9 @@
 #define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaMemcpyPeer hipMemcpyPeer
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
@@ -84,10 +86,13 @@
 #define cudaSetDevice hipSetDevice
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamLegacy hipStreamLegacy
 #define cudaStreamQuery hipStreamQuery

@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <tuple>
 #include <thread>
@@ -96,6 +97,108 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
             shard_names.push_back(buf);
         }
     }
+    return true;
+}
+
+// tools/exl3_pack.py's exl3.txt (an EXL3 pack; absent for a GGUF pack): the safetensors files, the EXL3 matrices
+// (index rows of kind x) and every routed expert's nine pieces.  false + empty err: no such file.
+namespace {
+struct Exl3Table {
+    std::vector<std::string> files;
+    struct Mat {
+        int file = 0;
+        uint64_t tr = 0, suh = 0, svh = 0;
+        int k = 0, n = 0, K = 0, cb = 2;
+        uint64_t vram() const {   // as load_pack uploads it: each piece 256-aligned
+            const auto up = [](uint64_t b) { return (b + 255u) & ~(uint64_t) 255u; };
+            return up((uint64_t) k * n * K / 8) + up(2 * (uint64_t) k) + up(2 * (uint64_t) n);
+        }
+    };
+    std::map<std::string, Mat> mats;
+    struct Layer {
+        int cb = -1, K[3] = {0, 0, 0}, k[3] = {0, 0, 0}, n[3] = {0, 0, 0};
+        std::vector<int> file;        // [9 e + 3 r + j]
+        std::vector<uint64_t> off;
+        uint64_t part(int r) const { return (uint64_t) k[r] * n[r] * K[r] / 8 + 2 * (uint64_t) k[r] + 2 * (uint64_t) n[r]; }
+        uint64_t blob() const { return 2 * part(0) + part(2); }
+    };
+    std::map<int, Layer> layers;
+};
+}  // namespace
+
+static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& err, int n_expert = 0) {
+    err.clear();
+    std::ifstream f(pack_dir + "/exl3.txt");
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string what;
+        ss >> what;
+        if (what == "file") {
+            int i = -1;
+            std::string nm;
+            if (!(ss >> i >> nm) || i != (int) t.files.size()) {
+                err = "exl3.txt: bad file line: " + line;
+                return false;
+            }
+            t.files.push_back(nm);
+        } else if (what == "mat") {
+            std::string nm;
+            Exl3Table::Mat m;
+            if (!(ss >> nm >> m.file >> m.tr >> m.suh >> m.svh >> m.k >> m.n >> m.K >> m.cb) || m.file < 0 ||
+                m.file >= (int) t.files.size()) {
+                err = "exl3.txt: bad mat line: " + line;
+                return false;
+            }
+            t.mats[nm] = m;
+        } else if (what == "layer") {
+            int il = -1;
+            Exl3Table::Layer L;
+            uint64_t gu = 0, dn = 0;
+            if (!(ss >> il >> L.cb >> L.K[0] >> L.K[1] >> L.K[2] >> L.k[0] >> L.n[0] >> L.k[2] >> L.n[2] >> gu >> dn)) {
+                err = "exl3.txt: bad layer line: " + line;
+                return false;
+            }
+            L.k[1] = L.k[0];
+            L.n[1] = L.n[0];
+            if (L.part(0) != gu || L.part(2) != dn) {
+                err = "exl3.txt: layer " + std::to_string(il) + "'s part sizes disagree with its shapes";
+                return false;
+            }
+            if (n_expert > 0) {
+                L.file.assign((size_t) n_expert * 9, -1);
+                L.off.assign((size_t) n_expert * 9, 0);
+            }
+            t.layers[il] = std::move(L);
+        } else if (what == "e") {
+            if (n_expert <= 0) continue;   // the sizing passes need the layers only
+            int il = -1, e = -1;
+            ss >> il >> e;
+            auto it = t.layers.find(il);
+            if (it == t.layers.end() || e < 0 || e >= n_expert) {
+                err = "exl3.txt: expert line for an unknown layer / expert: " + line;
+                return false;
+            }
+            for (int j = 0; j < 9; ++j) {
+                int fi = -1;
+                uint64_t off = 0;
+                if (!(ss >> fi >> off) || fi < 0 || fi >= (int) t.files.size()) {
+                    err = "exl3.txt: bad expert line: " + line;
+                    return false;
+                }
+                it->second.file[(size_t) e * 9 + (size_t) j] = fi;
+                it->second.off[(size_t) e * 9 + (size_t) j] = off;
+            }
+        }
+    }
+    for (const auto& kv : t.layers)
+        for (size_t i = 0; i < kv.second.file.size(); ++i)
+            if (kv.second.file[i] < 0) {
+                err = "exl3.txt: layer " + std::to_string(kv.first) + " lacks expert " + std::to_string(i / 9);
+                return false;
+            }
     return true;
 }
 
@@ -478,6 +581,24 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
 Glm5Model::~Glm5Model() {
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
+    if (!seq_.empty()) {   // STRATA_GLM_SEQS: sequence 0 goes back to the members (freed below), the others here
+        seq_bind(0);
+        for (size_t s = 0; s < seq_.size(); ++s) {
+            SeqCtx& c = seq_[s];
+            if (s > 0) {
+                for (float* d : {c.state, c.snap, c.snap_pool, c.kda_bak})
+                    if (d) cudaFree(d);
+                kv_stream_free(c.kv);   // (sequence 0's is kv_, freed below)
+            }
+            if (c.hop_h) cudaFreeHost(c.hop_h);
+            if (c.emb_h) cudaFreeHost(c.emb_h);
+            if (c.tok_h) cudaFreeHost(c.tok_h);
+            if (c.ev_hop) cudaEventDestroy(c.ev_hop);
+            if (c.ev_done) cudaEventDestroy(c.ev_done);
+        }
+        seq_.clear();
+    }
+    rows_destroy();
     fast_destroy();
     if (!stage_workers_.empty()) {
         // stop the staging pool: without this the workers block in stage_cv_ forever and the
@@ -508,9 +629,17 @@ Glm5Model::~Glm5Model() {
     }
     for (void* ev : {tev_a_, tev_b_, tev_c_, tev_d_})
         if (ev) cudaEventDestroy((cudaEvent_t) ev);
+    if (!bias_tab_.empty()) {   // on the tail's device (freed above with its half; the device itself is still there)
+        cudaSetDevice(bias_dev_);
+        for (float* t : bias_tab_)
+            if (t) cudaFree(t);
+        bias_tab_.clear();
+        cudaSetDevice(dev_);
+    }
     if (d_tok_) cudaFree(d_tok_);
     if (w_arena_) cudaFree(w_arena_);
     if (mtp_arena_) cudaFree(mtp_arena_);
+    kv_stream_free(kv_);
     if (state_) cudaFree(state_);
     if (sc_) cudaFree(sc_);
     if (d_pos_) cudaFree(d_pos_);
@@ -648,14 +777,164 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
 void Glm5Model::reset() {
     if (!loaded_) return;
     cudaSetDevice(dev_);
-    cudaMemset(state_, 0, state_bytes_);
+    // The state zeroed on the stream that reads it next, and waited for: the fast path's streams are non-blocking, so
+    // nothing orders a legacy-stream memset before them. Windows' HIP runtime submits queued work only when the host
+    // waits on it - the next conversation's prompt read the previous one's state, and the memset landed in the middle
+    // of it (#133: a conversation taken back from a slot answered the other one's question, then looped).
+    if (fast_ != nullptr) {
+        cudaMemsetAsync(state_, 0, state_bytes_, fast_->cs);
+        kv_stream_reset_maps();   // (the zeroed slots hold no block now - on the same stream)
+        if (cudaStreamSynchronize(fast_->cs) == cudaSuccess && fast_->route_error_h)
+            *fast_->route_error_h = 0;   // a failed route belongs to the previous request
+    } else {
+        cudaMemset(state_, 0, state_bytes_);
+        cudaStreamSynchronize(0);
+    }
     pos_ = 0;
-    if (fast_ && fast_->route_error_h && cudaStreamSynchronize(fast_->cs) == cudaSuccess)
-        *fast_->route_error_h = 0;   // a failed route belongs to the previous request
+    mtp_hx_pos_ = -1;   // (head_x holds no position of the new sequence)
+    dflash_reset();   // a new sequence: the drafter's cached positions belong to the old one
     if (split_next_) {
         split_next_->reset();
         cudaSetDevice(dev_);
     }
+}
+
+// ---- KV streaming (strata/kernels/glm_kv_stream.hpp)
+int64_t Glm5Model::kv_resident_cells(int kpool, int64_t max_ctx) {
+    const char* v = getenv("STRATA_GLM_KV_RESIDENT");
+    const long long want = v != nullptr ? std::atoll(v) : 0;
+    if (want <= 0 || kpool <= 0) return 0;
+    int64_t cells = std::max<int64_t>(want, strata::kernels::glmf::kKvResidentMin);
+    cells = (cells + kpool - 1) / kpool * kpool;
+    return cells < max_ctx ? cells : 0;   // a context of N positions or fewer is not streamed
+}
+
+int64_t Glm5Model::kv_resident() const {
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a part without DSA layers streams none)
+        if (m->kv_ != nullptr) return m->kv_->slots * m->kv_->page;
+    return 0;
+}
+
+// This part's DSA layers (the NextN block's too) keep a sequence's latent cache in one pinned, device-mapped host
+// allocation - the authoritative copy, written by both dsa_preps - and `cells` positions of it in VRAM: the state arena's
+// latent runs are the VRAM slots, and every layer gets a residency map (one device allocation for all of them), nothing
+// resident.  ctx: that sequence's context.  Under WSL the driver pins only about 1 GB in all, which the start reports as
+// an error.  Null with err empty: no DSA layer on this part.
+Glm5Model::KvStream* Glm5Model::kv_stream_make(int64_t cells, int64_t ctx, std::string& err) {
+    namespace k = strata::kernels;
+    const std::vector<int> ls = dsa_layers();
+    if (ls.empty()) return nullptr;
+    auto* K = new KvStream();
+    K->page = g_.idx_kpool;
+    K->row_bytes = lat_q8_ ? k::glmf::lat8_rec_bytes(g_.kv_lora) : g_.kv_lora * 2;
+    K->slots = cells / K->page;
+    K->n_blocks = (ctx + K->page - 1) / K->page;
+    const auto fail = [&](const std::string& e) {
+        err = e;
+        kv_stream_free(K);
+        return nullptr;
+    };
+    if (K->slots < k::glmf::kKvResolveBlock || (int64_t) K->page * K->row_bytes % 16 != 0)
+        return fail("KV streaming: " + std::to_string(K->slots) + " pages of " + std::to_string(K->page * K->row_bytes) +
+                    " bytes a layer - the resolve needs at least " + std::to_string(k::glmf::kKvResolveBlock) +
+                    " pages of whole 16-byte runs");
+    const uint64_t layer_bytes = (uint64_t) K->n_blocks * K->page * K->row_bytes;
+    K->host_bytes = layer_bytes * ls.size();
+    uint8_t* d = nullptr;
+    if (cudaHostAlloc((void**) &K->host_arena, K->host_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &d, K->host_arena, 0) != cudaSuccess) {
+        cudaGetLastError();
+        char b[320];
+        std::snprintf(b, sizeof b, "KV streaming: cannot pin %.2f GB of RAM for the latent cache - lower the context, or "
+                      "turn it off (--kv-streaming off in the config's args; under WSL the driver pins only about 1 GB in "
+                      "all)", (double) K->host_bytes / 1e9);
+        return fail(b);
+    }
+    const auto a16 = [](uint64_t n) { return (n + 15) & ~(uint64_t) 15; };
+    const uint64_t per = a16((uint64_t) K->n_blocks * 4) + 5 * a16((uint64_t) K->slots * 4) + a16(k::kKvCtlInts * 4);
+    if (cudaMalloc(&K->map_arena, per * ls.size()) != cudaSuccess) {
+        cudaGetLastError();
+        K->map_arena = nullptr;
+        return fail("KV streaming: the residency maps did not allocate");
+    }
+    K->host.assign((size_t) g_.n_layers + 1, nullptr);
+    K->map.assign((size_t) g_.n_layers + 1, k::KvStreamMap{});
+    for (size_t i = 0; i < ls.size(); ++i) {
+        const size_t il = (size_t) ls[i];
+        K->host[il] = d + i * layer_bytes;
+        uint8_t* at = (uint8_t*) K->map_arena + i * per;
+        const auto take = [&](uint64_t n) {
+            int32_t* r = (int32_t*) at;
+            at += a16(n * 4);
+            return r;
+        };
+        k::KvStreamMap& m = K->map[il];
+        m.page_table = take((uint64_t) K->n_blocks);
+        m.slot_block = take((uint64_t) K->slots);
+        m.slot_stamp = take((uint64_t) K->slots);
+        m.slot_ref = take((uint64_t) K->slots);
+        m.miss_block = take((uint64_t) K->slots);
+        m.miss_slot = take((uint64_t) K->slots);
+        m.ctl = take(k::kKvCtlInts);
+        m.n_blocks = K->n_blocks;
+        m.n_slots = K->slots;
+        k::kv_stream_reset(m, nullptr);
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) return fail("KV streaming: the residency maps did not reset");
+    std::fprintf(stderr, "glm pack: CUDA%d KV streaming: %lld of %lld positions of each of %zu DSA layers in VRAM (%.2f "
+                         "GB), the latent cache in %.2f GB of pinned RAM\n", dev_, (long long) cells, (long long) ctx,
+                 ls.size(), (double) cells * K->row_bytes * ls.size() / 1e9, (double) K->host_bytes / 1e9);
+    return K;
+}
+
+void Glm5Model::kv_stream_free(KvStream* K) {
+    if (K == nullptr) return;
+    if (K->host_arena) cudaFreeHost(K->host_arena);
+    if (K->map_arena) cudaFree(K->map_arena);
+    delete K;
+}
+
+// the first sequence's stream (the only one without STRATA_GLM_SEQS); the prompt path's staging copy is sized for it,
+// the longest context of them all
+bool Glm5Model::kv_stream_setup(int64_t cells, std::string& err) {
+    kv_ = kv_stream_make(cells, max_ctx_, err);
+    if (kv_ != nullptr) kv_stage_bytes_ = (uint64_t) kv_->n_blocks * kv_->page * kv_->row_bytes;
+    return kv_ != nullptr || err.empty();
+}
+
+// Every block evicted (the slots' contents are stale or zeroed); the host copies are not cleared - no reader names a
+// position before this sequence has written it.  On the compute stream, after anything still queued there.
+void Glm5Model::kv_stream_reset_maps() {
+    if (kv_ == nullptr) return;
+    cudaSetDevice(dev_);
+    for (const auto& m : kv_->map)
+        if (m.page_table != nullptr) strata::kernels::kv_stream_reset(m, fast_ != nullptr ? (void*) fast_->cs : nullptr);
+}
+
+Glm5Model::KvStreamStats Glm5Model::kv_stream_stats() const {
+    KvStreamStats r;
+    int cur = 0;
+    cudaGetDevice(&cur);
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        std::vector<const KvStream*> ks = {m->kv_};   // the bound sequence's, and every other's (STRATA_GLM_SEQS)
+        for (const SeqCtx& c : m->seq_) ks.push_back(c.kv);
+        cudaSetDevice(m->dev_);
+        if (m->fast_ != nullptr) cudaStreamSynchronize(m->fast_->cs);
+        for (const KvStream* K : ks) {
+            if (K == nullptr) continue;
+            for (const auto& mp : K->map) {
+                if (mp.page_table == nullptr) continue;
+                const strata::kernels::KvStreamCounters c = strata::kernels::kv_stream_counters(mp);
+                r.lookups += c.lookups;
+                r.misses += c.misses;
+                r.overflow = r.overflow || c.overflow;
+            }
+            r.host_gb += (double) K->host_bytes / 1e9;
+            r.block_bytes = K->page * K->row_bytes;
+        }
+    }
+    cudaSetDevice(cur);
+    return r;
 }
 
 bool Glm5Model::forward(const std::vector<int32_t>& tokens, std::vector<float>& logits_out,
@@ -688,9 +967,48 @@ bool Glm5Model::forward(const std::vector<int32_t>& tokens, std::vector<float>& 
     return true;
 }
 
+const float* Glm5Model::logit_bias_table(int slot, const std::vector<std::pair<int32_t, float>>& bias,
+                                         std::string& err) {
+    if (bias.empty()) return nullptr;
+    if (slot < 0 || slot >= seq_count()) {
+        err = "logit_bias: no conversation slot " + std::to_string(slot);
+        return nullptr;
+    }
+    Glm5Model* tail = this;
+    while (tail->split_next_) tail = tail->split_next_.get();
+    const size_t n = (size_t) g_.n_vocab;
+    std::vector<float> host(n, 0.0f);
+    for (const auto& [id, b] : bias) {
+        if (id < 0 || (size_t) id >= n) {
+            err = "logit_bias: token " + std::to_string(id) + " is outside the vocabulary";
+            return nullptr;
+        }
+        host[(size_t) id] = b;
+    }
+    cudaSetDevice(tail->dev_);
+    if (bias_tab_.empty()) {
+        bias_tab_.assign((size_t) seq_count(), nullptr);
+        bias_dev_ = tail->dev_;
+    }
+    float*& tab = bias_tab_[(size_t) slot];
+    cudaError_t e = tab == nullptr ? cudaMalloc(&tab, n * sizeof(float)) : cudaSuccess;
+    // synchronous: the table is written before any of this request's samples read it, and no earlier request's
+    // sample still reads it (a slot runs one request at a time, and its last sample was synchronised)
+    if (e == cudaSuccess) e = cudaMemcpy(tab, host.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+    // a copy from pageable memory can return before its DMA lands, and the sampler runs on non-blocking streams
+    // that do not wait for the default stream: wait for it here
+    if (e == cudaSuccess) e = cudaStreamSynchronize(nullptr);
+    cudaSetDevice(dev_);
+    if (e != cudaSuccess) {
+        err = std::string("logit_bias: the table did not upload: ") + cudaGetErrorString(e);
+        return nullptr;
+    }
+    return tab;
+}
+
 int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err) {
-    // the fast path already ran the greedy argmax on the device at the end of the forward
-    if (fast_ != nullptr && sp.greedy && last_tok_ >= 0) return last_tok_;
+    // the fast path already ran the greedy argmax on the device at the end of the forward (an unbiased one)
+    if (fast_ != nullptr && sp.greedy && sp.logit_bias == nullptr && last_tok_ >= 0) return last_tok_;
     Glm5Model* tail = this;
     while (tail->split_next_) tail = tail->split_next_.get();
     if (tail->d_tok_ == nullptr) {
@@ -723,9 +1041,57 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
               " boundaries (2.." + std::to_string(kMaxParts) + " devices)";
         return false;
     }
+    std::string where;
+    // STRATA_GLM_PARALLEL_LOAD=0: sequential. Parts stay unlinked until loaded (load_pack's reset() walks split_next_)
+    const char* pl = getenv("STRATA_GLM_PARALLEL_LOAD");
+    if (pl == nullptr || std::atoi(pl) != 0) {
+        std::vector<std::unique_ptr<Glm5Model>> owned((size_t) n);
+        std::vector<Glm5Model*> parts((size_t) n, this);
+        for (int i = 1; i < n; ++i) owned[(size_t) i].reset(new Glm5Model()), parts[(size_t) i] = owned[(size_t) i].get();
+        SplitLoad sl(n);
+        std::vector<std::string> errs((size_t) n);
+        std::vector<char> ok((size_t) n, 0);
+        std::vector<std::thread> th;
+        for (int i = 0; i < n; ++i) {
+            const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
+            Glm5Model* p = parts[(size_t) i];
+            p->n_parts_ = n;
+            p->part_ = i;
+            p->split_devs_ = devs;
+            p->split_load_ = &sl;
+            p->defer_lane_ = true;
+            p->dflash_path_ = dflash_path_;   // the drafter: the part with the head loads it, every part sizes for it
+            p->profile_path_ = profile_path_;   // every part reads the same profile
+            th.emplace_back([&, i, l0, l1, p] {
+                ok[(size_t) i] = p->load_pack(pack_dir, max_ctx, errs[(size_t) i], devs[(size_t) i], l0, l1);
+                sl.pass(i);       // (a part that stopped early, or never reached those turns, lets the others on)
+                sl.pass_pin(i);
+            });
+        }
+        for (auto& t : th) t.join();
+        for (int i = 0; i < n; ++i) {
+            parts[(size_t) i]->split_load_ = nullptr;
+            parts[(size_t) i]->defer_lane_ = false;
+        }
+        for (int i = 0; i < n; ++i)
+            if (!ok[(size_t) i]) {
+                err = errs[(size_t) i];
+                return false;
+            }
+        for (int i = n - 1; i >= 1; --i) parts[(size_t) i - 1]->split_next_ = std::move(owned[(size_t) i]);
+        for (int i = 0; i < n; ++i) {
+            if (!parts[(size_t) i]->fast_setup_finish(err)) {
+                split_next_.reset();
+                return false;
+            }
+            const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
+            where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
+                     ") on CUDA" + std::to_string(devs[(size_t) i]);
+        }
+        ram_left_check();
+    } else {
     Glm5Model* prev = nullptr;
     Glm5Model* m = this;
-    std::string where;
     for (int i = 0; i < n; ++i) {
         const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
         if (prev != nullptr) {
@@ -735,6 +1101,8 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->n_parts_ = n;
         m->part_ = i;
         m->split_devs_ = devs;
+        m->dflash_path_ = dflash_path_;
+        m->profile_path_ = profile_path_;   // every part reads the same profile
         if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
             if (prev != nullptr) prev->split_next_.reset();
             return false;
@@ -742,6 +1110,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
                  ") on CUDA" + std::to_string(devs[(size_t) i]);
         prev = m;
+    }
     }
     // the chunks are the smallest part's (as Strata's split): the others keep their pinned staging to that, and a
     // later card that holds the first one's chunk down is named (Strata #448: a small card in a split caps every
@@ -789,6 +1158,11 @@ static std::vector<int> glm_auto_bounds(const std::string& pack_dir, int n_layer
             if (ss >> layer >> gu >> dt >> off >> blob && layer >= 0 && layer < n_layers)
                 cost[(size_t) layer] += (double) blob * n_expert;
         }
+        Exl3Table xt;   // an EXL3 pack keeps its experts in exl3.txt
+        std::string xe;
+        if (exl3_table(pack_dir, xt, xe))
+            for (const auto& kv : xt.layers)
+                if (kv.first >= 0 && kv.first < n_layers) cost[(size_t) kv.first] += (double) kv.second.blob() * n_expert;
     }
     int cur = 0;
     cudaGetDevice(&cur);
@@ -862,10 +1236,12 @@ static double host_read_bps() {
 // where Strata's are fits to its model:
 //   - a part's room for experts: its free VRAM less its layers' dense weights and state at the context (index.txt and
 //     the GGUF directory, as load_pack sizes them), the head and the draft block on the last part, its scratch, and
-//     the reserve fast_setup keeps (pool_avail); the pool gives every layer the same number of slots;
-//   - the experts those slots hold: each layer's most routed, their share of its routes read off this machine's usage
-//     counts (expert_usage.txt; the pack's expert_counts.txt without them; Strata's coverage curve 1 - (1 - f)^3,
-//     STRATA_SPLIT_COVER_B, without either - that is what Strata has to assume, its profile carries only a ranking);
+//     the reserve fast_setup keeps (pool_budget: --vram-reserve-mib, or --expert-cache N on the first GPU); the pool
+//     gives every layer the same number of slots;
+//   - the experts those slots hold: each layer's most routed, their share of its routes read off the usage file's
+//     counts (STRATA_GLM_USAGE, opt-in; the pack's expert_counts.txt without it; Strata's coverage curve 1 - (1 - f)^3,
+//     an EXL3 pack's ^1.4, STRATA_SPLIT_COVER_B, without either - that is what Strata has to assume, its profile
+//     carries only a ranking);
 //   - a layer's time on its card: the bytes it reads (its dense weights and its VRAM experts' share of the routed
 //     ones) over the card's memory bandwidth - Strata scales a fitted per-layer time by SMs x clock; and each miss:
 //     the expert's bytes over the parts' share of the host's RAM read speed, measured here - the CPU lane computes
@@ -875,7 +1251,9 @@ static double host_read_bps() {
 //     part (the draft on the last one), and the sum breaks the tie;
 //   - the startability gate (Strata #1094): every part keeps its pool's floor and can lend a 512-token prompt chunk.
 // Two to four GPUs try every placement (memoised per part and range, as Strata's four-way search); more keep the
-// proportional split (glm_auto_bounds).  STRATA_GLM_SPLIT_LOG=1 prints every placement's prediction.
+// proportional split (glm_auto_bounds) - except a DFlash drafter's pipelined window, whose slowest part paces every
+// draft: there a DP over the layers for each cap on the slowest part.  STRATA_GLM_SPLIT_LOG=1 prints every
+// placement's prediction.
 static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& devs) {
     std::string err;
     std::vector<std::string> names;
@@ -900,6 +1278,11 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const auto tensor_bytes = [](const strata::TensorInfo* t) {
         return (double) ggml_row_size((ggml_type) t->type, t->shape[0]) * (double) (t->elements() / t->shape[0]);
     };
+    Exl3Table xtab;   // an EXL3 pack: its matrices (index kind x) and experts
+    {
+        std::string xe;
+        exl3_table(pack_dir, xtab, xe);
+    }
     // the dense weights: per layer, the rows every part loads, the head's (the last part) and token_embd (the first,
     // off the fast path)
     std::vector<double> dense((size_t) L + 1, 0.0);
@@ -913,8 +1296,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             std::string nm, served, kind;
             ss >> nm >> served >> kind;
             const strata::TensorInfo* t = find(nm);
-            if (t == nullptr) continue;
-            const double b = (double) pack_row_vram(nm, kind, t, fast);
+            const auto xm = xtab.mats.find(nm);
+            if (t == nullptr && (kind != "x" || xm == xtab.mats.end())) continue;
+            const double b = kind == "x" ? (double) xm->second.vram() : (double) pack_row_vram(nm, kind, t, fast);
             if (nm.rfind("blk.", 0) == 0) {
                 const int il = std::atoi(nm.c_str() + 4);
                 if (il >= 0 && il < L) dense[(size_t) il] += b;
@@ -929,9 +1313,23 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     }
     // the state at the context, as load_pack lays it out
     const double max_pools = (double) (max_ctx / g.idx_kpool);
-    const double lat = fast ? (double) g.kv_lora * (double) max_ctx / 2 : (double) g.kv_lora * (double) max_ctx;
+    // (KV streaming: VRAM slots for kv_cells positions; the prompt path borrows a staging copy of one layer's cache)
+    const int64_t kv_cells = fast ? Glm5Model::kv_resident_cells(g.idx_kpool, max_ctx) : 0;
+    const double lat_rows = (double) (kv_cells > 0 ? kv_cells : max_ctx);
+    const double lat = fast ? (double) g.kv_lora * lat_rows / 2 : (double) g.kv_lora * lat_rows;
+    const size_t kv_stage = kv_cells > 0 ? (size_t) g.kv_lora * 2 * (size_t) max_ctx : 0;
     const double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
     const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
+    // a DFlash drafter (STRATA_GLM_DFLASH): its file and ring on the last part; every part keeps the verify window's
+    // buffers - per KDA layer its state backup and the window's inputs, and ~32 MB of rows and logits
+    double dflash = 0, win_kda = 0, win_fixed = 0;
+    if (const char* df = getenv("STRATA_GLM_DFLASH"); df != nullptr && df[0] != '\0') {
+        std::error_code ec;
+        const auto fsz = std::filesystem::file_size(df, ec);
+        dflash = (ec ? 0.0 : (double) fsz) + (double) (96u << 20);
+        win_kda = kda_state + 4.0 * Glm5Model::kWinMax * (3.0 * g.d_inner() + 2.0 * g.kda_head_dim + g.n_head);
+        win_fixed = (double) (32u << 20);
+    }
     // the experts: a layer's blob and its VRAM slot's stride (native_experts.txt)
     std::vector<double> blob((size_t) L + 1, 0.0), stride((size_t) L + 1, 0.0);
     {
@@ -945,6 +1343,12 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             blob[(size_t) il] = (double) b;
             stride[(size_t) il] = (double) glmfast::expert_stride((size_t) b, (int) gu, (int) dt);
         }
+        for (const auto& kv : xtab.layers)
+            if (kv.first >= 0 && kv.first < L) {
+                blob[(size_t) kv.first] = (double) kv.second.blob();
+                stride[(size_t) kv.first] = (double) glmfast::expert_stride(
+                    (size_t) kv.second.blob(), strata::kernels::exl3::kTypeEXL3, strata::kernels::exl3::kTypeEXL3);
+            }
     }
     // the NextN draft block: the last part of a two-part split carries it (load_pack), from the model's GGUF or
     // STRATA_GLM_MTP_GGUF's; the pipelined decode drafts with it once a token
@@ -974,15 +1378,42 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
             mtp = true;
+        } else if (g.nextn > 0 && xtab.mats.count(P + "nextn.eh_proj.weight") && xtab.layers.count(L)) {
+            // an EXL3 pack: the block's matrices and experts from exl3.txt, its floats from the GGUF (as load_mtp)
+            double d = 0;
+            for (const char* nm : kMtpRaw)
+                if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
+            for (const char* nm : kMtpB16) {
+                if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
+                else if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 2;
+            }
+            for (const char* nm : kMtpF32)
+                if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 4;
+            blob[(size_t) L] = (double) xtab.layers.at(L).blob();
+            stride[(size_t) L] = (double) glmfast::expert_stride((size_t) xtab.layers.at(L).blob(),
+                                                                 strata::kernels::exl3::kTypeEXL3,
+                                                                 strata::kernels::exl3::kTypeEXL3);
+            mtp_dense = d;
+            mtp = true;
         }
     }
     const bool pipelined = n == 2 && mtp && getenv("STRATA_GLM_NO_SPEC") == nullptr;
-    // each layer's routes per expert: this machine's usage, else the pack's routing profile
+    // a DFlash drafter's pipelined window (dflash_pipelined): the anchor crosses every part, and each draft kept behind
+    // it costs about the slowest part, so a round of a kept drafts costs sum + a * slowest for a + 1 tokens (a ~1.5 at
+    // the pipelined window's default cut); the batched one crosses the parts in turn (the parts added)
+    const bool df_pipe = dflash > 0 && dflash_pipelined(n);
+    constexpr double kDfKept = 1.5;
+    // ... and there each layer also costs a fixed time a token beyond its reads (launches, the CPU lane's answer, the
+    // hops): Maya-L over 9 GPUs measured ~0.78 ms a layer on a 5060 Ti and ~0.59 on the 3090 (2.1x its bandwidth),
+    // ~0.4 ms of it fixed - priced by reads alone the 3090 took 10 layers and paced every draft (5.9 ms a kept draft;
+    // 8 layers: 4.9 ms, 57.1 / 58.9 -> 61.6 / 63.1 tok/s).  STRATA_GLM_SPLIT_LAYER_MS overrides it
+    const double layer_fixed = !df_pipe ? 0.0
+                               : getenv("STRATA_GLM_SPLIT_LAYER_MS") ? std::atof(getenv("STRATA_GLM_SPLIT_LAYER_MS"))
+                                                                     : 0.4;
+    // each layer's routes per expert: the usage file (opt-in), else the pack's routing profile
     std::vector<std::vector<double>> cnt((size_t) L + 1);
     {
-        const char* u = getenv("STRATA_GLM_USAGE");
-        const std::string up = u != nullptr ? (std::string(u) == "0" ? std::string() : std::string(u))
-                                            : pack_dir + "/expert_usage.txt";
+        const std::string up = glmfast::usage_file();
         std::ifstream uf(up);
         std::string line;
         while (!up.empty() && std::getline(uf, line)) {
@@ -1019,7 +1450,13 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         cover[(size_t) l].assign(c.size() + 1, 0.0);
         for (size_t i = 0; i < c.size(); ++i) cover[(size_t) l][i + 1] = cover[(size_t) l][i] + c[i] / tot;
     }
-    const double cover_b = getenv("STRATA_SPLIT_COVER_B") ? std::atof(getenv("STRATA_SPLIT_COVER_B")) : 3.0;
+    // (an EXL3 pack: 1.4 - its experts are bigger, a card holds fewer of a layer's, and there the routes are flatter
+    // than the curve at 3: EXL3-4.05bpw over 9 GPUs held 80% of a 5060 Ti layer's experts and hit VRAM on 89-96% of
+    // its routes, the curve's 1.4, not 99%.  At 3 the DFlash split kept the 3090 to 7 layers with 8 GB of it idle,
+    // the misses on the CPU lane: 63.8 / 32.6 / 64.4 tok/s; at 1.4 9 layers, 79.8 / 40.4 / 81.9)
+    const double cover_b = getenv("STRATA_SPLIT_COVER_B") ? std::atof(getenv("STRATA_SPLIT_COVER_B"))
+                           : !xtab.layers.empty()         ? 1.4
+                                                          : 3.0;
     const auto held_share = [&](int l, int64_t s) -> double {
         s = std::clamp<int64_t>(s, 0, g.n_expert);
         const auto& cv = cover[(size_t) l];
@@ -1056,7 +1493,12 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     for (auto& c : cards)
         if (c.bw <= 0) c.bw = 1e11;   // (no reading: every card the same, and the misses decide)
     const double host_bps = host_read_bps();
-    const double miss_bps = std::max(1e9, (host_bps > 0 ? host_bps : 2e10) / n);   // each part's lane, all at once
+    // each part's lane, all at once - except under a DFlash pipelined window (3+ GPUs): there ONE pool serves every
+    // part's misses as they come (fast_setup), at about half the host's all-core read speed (Maya-L over 9 GPUs: 0.14-
+    // 0.27 ms an 8.7 MB expert, 32-62 GB/s of 77; the host's / 9 priced a miss at ~1 ms and kept the 5060 Tis to the
+    // layers their pools held whole, the 3090 to 9-10)
+    const double miss_bps =
+        std::max(1e9, (host_bps > 0 ? host_bps : 2e10) / (df_pipe ? 2.0 : (double) n));
     double max_stride = 0;
     for (double st : stride) max_stride = std::max(max_stride, st);
     const double fixed = 8.0 * max_stride + (double) (256u << 20);   // the scratch slots and the activations
@@ -1075,11 +1517,11 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (const auto it = memo.find(key); it != memo.end()) return it->second;
         const bool last = i == n - 1;
         const Card& c = cards[(size_t) i];
-        double used = common + fixed + 4.0 * 2 * g.hc * g.n_embd + (i == 0 ? embd : 0.0);
+        double used = common + fixed + 4.0 * 2 * g.hc * g.n_embd + (i == 0 ? embd : 0.0) + win_fixed;
         double bsum = 0, ssum = 0, smax = 0;
         bool kda = false, dsa = false, dense_ffn = false, moe = false;
         for (int l = lb; l < le; ++l) {
-            used += dense[(size_t) l] + (g.is_recr(l) ? kda_state : dsa_state);
+            used += dense[(size_t) l] + (g.is_recr(l) ? kda_state + win_kda : dsa_state);
             (g.is_recr(l) ? kda : dsa) = true;
             if (moe_layer(l)) {
                 bsum += blob[(size_t) l];
@@ -1091,7 +1533,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             }
         }
         if (last) {
-            used += head;
+            used += head + dflash;
             if (mtp) {
                 used += mtp_dense + dsa_state;
                 bsum += blob[(size_t) L];
@@ -1101,7 +1543,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             }
         }
         const double room =
-            c.free > used ? (double) Glm5Model::pool_avail((size_t) (c.free - used), (size_t) c.total) : 0.0;
+            c.free > used ? (double) Glm5Model::pool_budget((size_t) (c.free - used), (size_t) c.total, i,
+                                                            (size_t) ((double) keep * ssum), (size_t) smax).avail
+                          : 0.0;
         Eval ev;
         ev.per = bsum > 0 ? std::min<int64_t>(g.n_expert, (int64_t) (room / bsum)) : 0;
         while (ev.per > 0 && (double) ev.per * ssum > room) --ev.per;
@@ -1109,7 +1553,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         ev.ok = ssum == 0 || ev.per >= keep;
         if (ev.ok && ssum > 0) {
             const double need = (double) glm_prefill_lend_bytes(g, 512, kda, dsa, dense_ffn, moe, last && mtp, max_ctx,
-                                                                (size_t) smax);
+                                                                (size_t) smax, dsa ? kv_stage : 0);
             const int64_t k = (int64_t) std::ceil(need / ssum);
             ev.ok = k + keep <= ev.per && k * 100 <= 90 * ev.per;
         }
@@ -1124,7 +1568,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                 ev.hits += h;
                 ev.routes += g.n_exp_used;
             }
-            return 1e3 * (gpu / c.bw + cpu / miss_bps);
+            return 1e3 * (gpu / c.bw + cpu / miss_bps) + layer_fixed;
         };
         for (int l = lb; l < le; ++l) ev.ms += layer_ms(l, dense[(size_t) l]);
         if (last) {
@@ -1146,7 +1590,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             slow = std::max(slow, ev.back().ms);
             ok = ok && ev.back().ok;
         }
-        obj = pipelined ? slow : sum;
+        obj = pipelined ? slow : df_pipe ? (sum + kDfKept * slow) / (1.0 + kDfKept) : sum;
         tie = pipelined ? sum : slow;
         return ok;
     };
@@ -1178,6 +1622,51 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         for (int k1 = 1; k1 + 2 < L; ++k1)
             for (int k2 = k1 + 1; k2 + 1 < L; ++k2)
                 for (int k3 = k2 + 1; k3 < L; ++k3) { b = {k1, k2, k3}; consider(); }
+    } else if (df_pipe) {
+        // more parts, a DFlash pipelined window: too many placements to try, so for each cap on the slowest part a DP
+        // over the layers finds the least sum whose parts all fit under it (part i on [lb, le), every part a layer
+        // at least); the caps are the part times seen (up to 400 of them, spread over their range)
+        std::vector<double> caps;
+        for (int i = 0; i < n; ++i)
+            for (int lb = i == 0 ? 0 : i; lb + (n - i) <= L && (i > 0 || lb == 0); ++lb)
+                for (int le = lb + 1; le + (n - 1 - i) <= L; ++le) {
+                    if (i == n - 1 && le != L) continue;
+                    const Eval e = stage(i, lb, le);
+                    if (e.ok) caps.push_back(e.ms);
+                }
+        std::sort(caps.begin(), caps.end());
+        caps.erase(std::unique(caps.begin(), caps.end()), caps.end());
+        const size_t nq = std::min<size_t>(caps.size(), 400);
+        const double inf = 1e30;
+        const size_t W = (size_t) L + 1;
+        std::vector<double> f((size_t) (n + 1) * W);
+        std::vector<int> from((size_t) (n + 1) * W, 0);
+        for (size_t q = 0; q < nq; ++q) {
+            const double cap = caps[nq < 2 ? 0 : q * (caps.size() - 1) / (nq - 1)];
+            std::fill(f.begin(), f.end(), inf);
+            f[0] = 0;   // f[i W + l]: the first i parts over layers [0, l)
+            for (int i = 0; i < n; ++i)
+                for (int lb = i; lb + (n - i) <= L; ++lb) {
+                    const double base = f[(size_t) i * W + lb];
+                    if (base >= inf) continue;
+                    for (int le = lb + 1; le + (n - 1 - i) <= L; ++le) {
+                        if (i == n - 1 && le != L) continue;
+                        const Eval e = stage(i, lb, le);
+                        if (!e.ok || e.ms > cap) continue;
+                        double& t = f[(size_t) (i + 1) * W + le];
+                        if (base + e.ms < t) {
+                            t = base + e.ms;
+                            from[(size_t) (i + 1) * W + le] = lb;
+                        }
+                    }
+                }
+            if (f[(size_t) n * W + L] >= inf) continue;
+            for (int i = n, l = L; i > 1; --i) {
+                l = from[(size_t) i * W + l];
+                b[(size_t) i - 2] = l;
+            }
+            consider();
+        }
     } else {
         return {};
     }
@@ -1186,8 +1675,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                      c.bw / 1e9, c.free / 1073741824.0);
     std::fprintf(stderr, "glm split auto: the host reads RAM at %.0f GB/s (a part's CPU lane: %.0f); the routes from %s; "
                          "%s\n", host_bps / 1e9, miss_bps / 1e9,
-                 cover[3].empty() ? "Strata's coverage curve (no usage counts)" : "the usage counts",
-                 pipelined ? "the pipelined decode: a token costs the slower part" : "a token costs the parts added");
+                 cover[3].empty() ? "the default coverage curve (no usage counts)" : "the usage counts",
+                 pipelined ? "the pipelined decode: a token costs the slower part"
+                 : df_pipe ? "the DFlash pipelined window: a round of a kept drafts costs the parts added + a x the slowest"
+                           : "a token costs the parts added");
     if (best.empty()) {
         if (best_any.empty()) return {};
         std::fprintf(stderr, "glm split auto: WARNING no placement leaves every part its pool's floor and a 512-token "
@@ -1214,8 +1705,28 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     return best;
 }
 
+// STRATA_GLM_DFLASH=<a DFlash2 GGUF drafted for this model> (the driver's --dflash): the decode drafts blocks with it
+// (decode_dflash).  It sits on the device of the part with the head and replaces the NextN block's drafting, so the
+// NextN block is not loaded (STRATA_GLM_NO_MTP) and the split search prices the drafter instead.
 bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std::string& err,
                               const std::string& layer_split) {
+    if (const char* df = getenv("STRATA_GLM_DFLASH"); df != nullptr && df[0] != '\0') {
+        dflash_path_ = df;
+        if (getenv("STRATA_GLM_NO_MTP") == nullptr) {
+#if defined(_WIN32)
+            _putenv_s("STRATA_GLM_NO_MTP", "1");
+#else
+            setenv("STRATA_GLM_NO_MTP", "1", 1);
+#endif
+        }
+        std::fprintf(stderr, "glm dflash: MTP off - the NextN draft block is not loaded, DFlash drafts instead\n");
+    }
+    if (!load_pack_place(pack_dir, max_ctx, err, layer_split)) return false;
+    return dflash_bind(err);
+}
+
+bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, std::string& err,
+                                const std::string& layer_split) {
     // the layer split is the DEFAULT on multi-GPU hosts (measured at steady state, 640-token GEN on
     // real text: 182 vs 840 MB/tok device bytes, decode 195 vs 506 ms/tok, hit 87-90 vs 64.4% - the
     // pools are per-part, so 2x capacity halves the demand reads).  STRATA_GLM_SPLIT=0 forces one
@@ -1223,6 +1734,15 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
     // two-part split (default 1), STRATA_GLM_DEVS the devices of any split.
     const char* sp = getenv("STRATA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
+    if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0') {
+        if ((!spec.empty() && spec != "0") || std::strspn(h, "0123456789") != std::strlen(h)) {
+            err = "GLM expert helper: give a helper device index, without a layer split";
+            return false;
+        }
+        double free_gib = 0;
+        if (!RemoteExperts::preflight(std::atoi(h), free_gib, err)) return false;
+        return load_pack(pack_dir, max_ctx, err);   // dense/state/MTP stay on device 0
+    }
     const auto ints = [](const std::string& s, std::vector<int>& out) {
         out.clear();
         std::stringstream ss(s);
@@ -1255,10 +1775,12 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
         if (devs.size() < 2) return load_pack(pack_dir, max_ctx, err, devs.empty() ? 0 : devs[0]);
         if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr)
             if (const char* d1 = getenv("STRATA_GLM_DEV1")) devs[1] = std::atoi(d1);
-        // --layer-split auto: Strata's split search over two to four GPUs; more (or a pack it cannot read) share the
-        // layers by free VRAM - two GPUs at the midpoint, plus two layers for the head half when the tail also runs
+        // --layer-split auto: Strata's split search over two to four GPUs (and over more for a DFlash drafter's
+        // pipelined window); more (or a pack it cannot read) share the layers by free VRAM - two GPUs at the midpoint, plus two layers for the head half when the tail also runs
         // the NextN draft block (2x V100, split 22 / 23 / 24 / 25 / 26 -> 36.3 / 36.7 / 40.0 / 37.3 / 39.4 tok/s)
-        if (devs.size() <= 4) bounds = glm_search_bounds(pack_dir, max_ctx, devs);
+        const char* dfl = getenv("STRATA_GLM_DFLASH");
+        if (devs.size() <= 4 || (dfl != nullptr && dfl[0] != '\0' && dflash_pipelined((int) devs.size())))
+            bounds = glm_search_bounds(pack_dir, max_ctx, devs);
         if (bounds.empty() && devs.size() == 2)
             bounds = {g_.n_layers / 2 +
                       (getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr ? 2 : 0)};
@@ -2047,6 +2569,33 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
 #endif
 }
 
+// Windows: while a file has a mapped view, every unbuffered read of it takes NTFS's cache-coherency path - the
+// decode's expert reads ran 3x as long (an expert in 24 parallel reads: 5.4 ms with the shards mapped, 1.8 ms
+// without; RTX 5090 Laptop, Intel RST RAID 0 of two NVMe drives, Maya-S24).  Once the load is done the fast path
+// reads the shards through h_direct only, and token_embd through pack_emb_src_: the table moves to the heap
+// (~0.7 GB for GLM-5.3-Flash's Q8_0 rows) and the views go.  Kept when a shard has no unbuffered handle (its reads
+// fall back to the view) or with STRATA_GLM_KEEP_MAP=1.
+void strata::core::Glm5Model::pack_release_views() {
+#ifdef _WIN32
+    const char* km = getenv("STRATA_GLM_KEEP_MAP");
+    if (km != nullptr && std::atoi(km) != 0) return;
+    for (const Shard& s : pack_shards_)
+        if (s.base != nullptr && s.h_direct == nullptr) return;
+    for (const Shard& s : pack_shards_)
+        if (pack_emb_src_ != nullptr && pack_emb_src_ >= s.base && pack_emb_src_ < s.base + s.size) {
+            const size_t bytes = (size_t) g_.n_vocab * ggml_row_size((ggml_type) pack_emb_type_, g_.n_embd);
+            pack_emb_copy_.assign(pack_emb_src_, pack_emb_src_ + bytes);
+            pack_emb_src_ = pack_emb_copy_.data();
+            break;
+        }
+    for (Shard& s : pack_shards_)
+        if (s.base != nullptr) {
+            UnmapViewOfFile(s.base);
+            s.base = nullptr;
+        }
+#endif
+}
+
 bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_ctx, std::string& err, int dev,
                                         int l0, int l1) {
     dev_ = dev;
@@ -2173,6 +2722,59 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
     }
 
+    // 3b. an EXL3 pack (tools/exl3_pack.py's exl3.txt): the model's safetensors join the shards after the GGUF; each
+    //     routed expert is nine pieces in them (gate, up, down x trellis, suh, svh), assembled into the usual
+    //     [gate | up | down] blob as it is read; the matrices are index rows of kind x, uploaded below
+    namespace x3 = strata::kernels::exl3;
+    Exl3Table xt;
+    {
+        std::string xe;
+        if (exl3_table(pack_dir, xt, xe, g_.n_expert)) {
+            exl3_ = true;
+            exl3_shard0_ = (int) pack_shards_.size();
+            for (const auto& fn : xt.files) {
+                Shard s;
+                if (!pack_shard_mmap(dir2 + "/" + fn, s, 0, err)) return false;
+                pack_shards_.push_back(s);
+            }
+            for (auto& kv : xt.layers) {
+                const int il = kv.first;
+                const Exl3Table::Layer& X = kv.second;
+                if (il < 0 || il >= g_.n_layers) continue;
+                if (X.k[0] != g_.n_embd || X.n[0] != g_.n_ff_exp || X.k[2] != g_.n_ff_exp || X.n[2] != g_.n_embd) {
+                    err = "pack: exl3.txt layer " + std::to_string(il) + "'s expert shapes disagree with the geometry";
+                    return false;
+                }
+                NativeLayer nl;
+                nl.layer = il;
+                nl.fmt.gu_type = nl.fmt.d_type = x3::kTypeEXL3;
+                nl.x_cb = X.cb;
+                for (int r = 0; r < 3; ++r) {
+                    nl.x_K[r] = X.K[r];
+                    nl.x_k[r] = X.k[r];
+                    nl.x_n[r] = X.n[r];
+                }
+                nl.x_off = X.off;
+                nl.x_shard.resize(X.file.size());
+                for (size_t i = 0; i < X.file.size(); ++i) {
+                    nl.x_shard[i] = exl3_shard0_ + X.file[i];
+                    const int r = (int) (i % 9) / 3, j = (int) (i % 3);
+                    if (X.off[i] + nl.x_piece(r, j) > pack_shards_[(size_t) nl.x_shard[i]].size) {
+                        err = "pack: exl3.txt layer " + std::to_string(il) + " expert " + std::to_string(i / 9) +
+                              " lies past the end of " + xt.files[(size_t) X.file[i]];
+                        return false;
+                    }
+                }
+                pack_layers_[(size_t) il] = std::move(nl);
+            }
+            std::fprintf(stderr, "glm pack: CUDA%d EXL3: %zu safetensors, %zu matrices, %zu expert layers\n", dev_,
+                         xt.files.size(), xt.mats.size(), xt.layers.size());
+        } else if (!xe.empty()) {
+            err = "pack: " + xe;
+            return false;
+        }
+    }
+
     // 4. the dense tensors: dequantize everything into the F32 device arena.  F32 rows come
     //    straight out of dense.bin; every other kind (BF16 rows and the natively-served
     //    quantized rows) is resolved through the GGUF shards and dequantized by ggml's traits.
@@ -2206,6 +2808,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // so this is lossless; F32 expansion doubled their bytes and their read time) and does not upload
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
+    if (exl3_ && !fast_mode_) {
+        err = "pack: an EXL3 model runs on the fast path only (unset STRATA_GLM_SLOW)";
+        return false;
+    }
     const auto keep16 = [&](const Row& r, const strata::TensorInfo* t) {
         return fast_mode_ && r.kind == "4" && t->elements() >= 65536;
     };
@@ -2231,6 +2837,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     };
     for (const auto& r : rows) {
         if (!row_in_range(r.name)) continue;   // the other half's rows live on the other device
+        if (r.kind == "x") {   // an EXL3 matrix (exl3.txt)
+            const auto xm = xt.mats.find(r.name);
+            if (xm == xt.mats.end()) {
+                err = "pack: EXL3 row " + r.name + " is not in exl3.txt";
+                return false;
+            }
+            bytes += xm->second.vram();
+            by_kind[kind_of(r.name.substr(r.name.find('.', 4) + 1)) + " exl3"] += xm->second.vram();
+            continue;
+        }
         const strata::TensorInfo* t = find_tensor(r.name);
         if (!t) {
             err = "pack: tensor " + r.name + " is in index.txt but in no shard";
@@ -2262,6 +2878,50 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     std::vector<uint8_t> raw;
     for (const auto& r : rows) {
         if (!row_in_range(r.name)) continue;   // the other half's rows live on the other device
+        if (r.kind == "x") {
+            // the trellis, suh and svh straight from the safetensors mapping, each 256-aligned in the arena
+            const Exl3Table::Mat& m = xt.mats.at(r.name);
+            const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
+            const uint64_t nb[3] = {(uint64_t) m.k * m.n * m.K / 8, 2 * (uint64_t) m.k, 2 * (uint64_t) m.n};
+            const uint64_t src[3] = {m.tr, m.suh, m.svh};
+            uint8_t* dst[3] = {nullptr, nullptr, nullptr};
+            for (int j = 0; j < 3; ++j) {
+                if (src[j] + nb[j] > sh.size) {
+                    err = "pack: EXL3 " + r.name + " lies past the end of " + xt.files[(size_t) m.file];
+                    return false;
+                }
+                dst[j] = (uint8_t*) w_arena_ + at;
+                { cudaError_t e_ = cudaMemcpy(dst[j], sh.base + src[j], (size_t) nb[j], cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+                at += (nb[j] + 255u) & ~(uint64_t) 255u;
+            }
+            x3::Mat M;
+            M.trellis = (const uint32_t*) dst[0];
+            M.suh = (const uint16_t*) dst[1];
+            M.svh = (const uint16_t*) dst[2];
+            M.k = m.k;
+            M.n = m.n;
+            M.K = m.K;
+            M.cb = m.cb;
+            if (!x3::supported(M)) {
+                err = "pack: EXL3 " + r.name + " (k " + std::to_string(m.k) + " n " + std::to_string(m.n) + " K " +
+                      std::to_string(m.K) + " cb " + std::to_string(m.cb) + ") is not covered by the kernels";
+                return false;
+            }
+            const x3::Mat& slot = exl3_mats_[r.name] = M;
+            ws_map_[r.name] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, m.n};
+            // the fused KDA projection: q, k and v are its column thirds (tools/exl3_pack.py keeps llama.cpp's order)
+            const std::string fused = "attn_qkv.weight";
+            if (r.name.size() > fused.size() && r.name.compare(r.name.size() - fused.size(), fused.size(), fused) == 0) {
+                const std::string P = r.name.substr(0, r.name.size() - fused.size());
+                const int third = m.n / 3;
+                const char* part[3] = {"attn_q.weight", "attn_k.weight", "attn_v.weight"};
+                for (int i = 0; i < 3; ++i) {
+                    const x3::Mat& v = exl3_mats_[P + part[i]] = x3::view(M, i * third, third);
+                    ws_map_[P + part[i]] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &v, m.k, third};
+                }
+            }
+            continue;
+        }
         const strata::TensorInfo* t = find_tensor(r.name);
         if (skip_upload(r)) {
             const int si = find_shard_of(r.name);
@@ -2393,11 +3053,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         std::fprintf(stderr, "glm mtp: CUDA%d the draft block from %s%s\n", dev_, mtp_gguf,
                      own ? " (instead of the model's own)" : "");
     }
-    // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded)
+    // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded; one GPU loads it
+    // for the one-GPU MTP decode - glm_mtp.cu: by default on the Strix / Gorgon Halo APUs)
+    const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_);
     if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
-        (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr)) {   // any split: the speculative decode runs on 2+ parts
+        (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
+        if (mtp_il_ >= 0 && mtp_one) mtp_vocab_scan(gfs);   // the draft head's vocabulary
     }
 
     // 5. the router bias, host-side: the prefetch ranks the next-best experts per layer, and the
@@ -2418,10 +3081,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
     lat_q8_ = fast_mode_ && g_.kv_lora % 32 == 0 && getenv("STRATA_GLM_KV_INT8") != nullptr &&
               std::atoi(getenv("STRATA_GLM_KV_INT8")) != 0;
+    // KV streaming (--kv-resident N): the latent cache lives in pinned RAM and the state holds N positions of VRAM slots
+    // a layer (kv_stream_setup, below)
+    const int64_t kv_cells = fast_mode_ ? kv_resident_cells(g_.idx_kpool, max_ctx) : 0;
+    const int64_t lat_rows = kv_cells > 0 ? kv_cells : max_ctx;
     // (INT8: lat8_rec_bytes per position, a multiple of 16 bytes at kv_lora 512)
-    const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * max_ctx
-                               : fast_mode_ ? (int64_t) g_.kv_lora * max_ctx / 2
-                                            : (int64_t) g_.kv_lora * max_ctx;
+    const int64_t lat_floats = lat_q8_      ? (int64_t) strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora) / 4 * lat_rows
+                               : fast_mode_ ? (int64_t) g_.kv_lora * lat_rows / 2
+                                            : (int64_t) g_.kv_lora * lat_rows;
     if (lat_q8_) std::fprintf(stderr, "glm pack: CUDA%d latent cache INT8 (%d bytes a position and layer)\n", dev_,
                               strata::kernels::glmf::lat8_rec_bytes(g_.kv_lora));
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
@@ -2464,6 +3131,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     state_bytes_ = (uint64_t) floats * sizeof(float);
     { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    if (kv_cells > 0 && !kv_stream_setup(kv_cells, err)) return false;
+    if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
 
     const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
     int64_t s = 0;
@@ -2648,6 +3317,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     host_hq_.resize(strata::kernels::cpu::kNativeHBytes);
     pack_ = true;
     loaded_ = true;
+    if (fast_mode_) pack_release_views();   // before fast_setup: its RAM tier sees the embedding's heap copy
+    // a DFlash drafter on the part with the head: its weights and ring before the expert pool is sized
+    dflash_on_ = fast_mode_ && !dflash_path_.empty();
+    if (!dflash_path_.empty() && l1_ == g_.n_layers) {
+        if (!fast_mode_)
+            std::fprintf(stderr, "glm dflash: the draft needs the fast path (STRATA_GLM_SLOW is set) - drafting off\n");
+        else if (!dflash_load(dflash_path_, dev_, err))
+            return false;
+    }
     if (fast_mode_ && !fast_setup(err)) return false;
     reset();
     return true;
@@ -2677,17 +3355,48 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return nullptr;
     };
     int si = -1;
-    if (find(P + "nextn.eh_proj.weight", si) == nullptr) return true;   // a GGUF without the draft block
+    // an EXL3 pack: the block's quantized projections and routed experts are in exl3.txt (its floats in the GGUF)
+    Exl3Table xt;
+    if (exl3_) {
+        std::string xe;
+        if (!exl3_table(pack_dir_, xt, xe, g_.n_expert)) {
+            err = "mtp: " + (xe.empty() ? std::string("exl3.txt is gone") : xe);
+            return false;
+        }
+        if (xt.mats.count(P + "nextn.eh_proj.weight") == 0) return true;   // packed without the draft block
+    } else if (find(P + "nextn.eh_proj.weight", si) == nullptr) {
+        return true;   // a GGUF without the draft block
+    }
+    const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
     const auto& raw_names = kMtpRaw;
     const auto& b16_names = kMtpB16;
     const auto& f32_names = kMtpF32;
     uint64_t bytes = 0;
-    if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err)) return false;
+    if (exl3_) {
+        for (const char* n : raw_names) {
+            if (!x3(P + n)) { err = "mtp: " + P + n + " is not in exl3.txt"; return false; }
+            bytes += xt.mats.at(P + n).vram();
+        }
+        for (const char* n : b16_names) {
+            if (x3(P + n)) { bytes += xt.mats.at(P + n).vram(); continue; }
+            const strata::TensorInfo* t = find(P + n, si);
+            if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
+            bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
+        }
+        for (const char* n : f32_names) {
+            const strata::TensorInfo* t = find(P + n, si);
+            if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
+            bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
+        }
+    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err)) {
+        return false;
+    }
     if (cudaMalloc(&mtp_arena_, bytes) != cudaSuccess) {
         cudaGetLastError();
         err = "mtp: the draft block's weights (" + std::to_string(bytes >> 20) + " MB) did not allocate";
         return false;
     }
+    mtp_arena_bytes_ = bytes;
     uint64_t at = 0;
     uint8_t* base = (uint8_t*) mtp_arena_;
     std::vector<float> host;
@@ -2702,7 +3411,40 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         }
         return pack_dequant_tensor(*t, src_of(t, s), host, err);
     };
+    // an EXL3 matrix: its trellis, suh and svh from the safetensors, each 256-aligned (as load_pack's)
+    const auto up_x3 = [&](const std::string& n) -> bool {
+        const Exl3Table::Mat& m = xt.mats.at(n);
+        const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
+        const uint64_t nb[3] = {(uint64_t) m.k * m.n * m.K / 8, 2 * (uint64_t) m.k, 2 * (uint64_t) m.n};
+        const uint64_t src[3] = {m.tr, m.suh, m.svh};
+        uint8_t* dst[3] = {nullptr, nullptr, nullptr};
+        for (int j = 0; j < 3; ++j) {
+            if (src[j] + nb[j] > sh.size) { err = "mtp: EXL3 " + n + " lies past the end of its file"; return false; }
+            dst[j] = base + at;
+            if (cudaMemcpy(dst[j], sh.base + src[j], (size_t) nb[j], cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "mtp: upload";
+                return false;
+            }
+            at += (nb[j] + 255u) & ~(uint64_t) 255u;
+        }
+        strata::kernels::exl3::Mat M;
+        M.trellis = (const uint32_t*) dst[0];
+        M.suh = (const uint16_t*) dst[1];
+        M.svh = (const uint16_t*) dst[2];
+        M.k = m.k;
+        M.n = m.n;
+        M.K = m.K;
+        M.cb = m.cb;
+        if (!strata::kernels::exl3::supported(M)) { err = "mtp: EXL3 " + n + " is not covered by the kernels"; return false; }
+        const strata::kernels::exl3::Mat& slot = exl3_mats_[n] = M;
+        ws_map_[n] = strata::core::WSlot{nullptr, strata::kernels::exl3::kTypeEXL3, &slot, m.k, m.n};
+        return true;
+    };
     for (const char* n : raw_names) {
+        if (exl3_) {
+            if (!up_x3(P + n)) return false;
+            continue;
+        }
         const strata::TensorInfo* t = find(P + n, si);
         const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
         if (cudaMemcpy(base + at, src_of(t, si), nb, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
@@ -2712,6 +3454,10 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     }
     std::vector<uint16_t> b16;
     for (const char* n : b16_names) {
+        if (x3(P + n)) {   // (an EXL3 pack quantizes the indexer's q_b: the fast path reads it from ws_map_)
+            if (!up_x3(P + n)) return false;
+            continue;
+        }
         const strata::TensorInfo* t = find(P + n, si);
         if (!to_host(t, si)) return false;
         b16.resize(host.size());
@@ -2736,6 +3482,47 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     // the routed experts: gate/up/down by absolute offset, like native_experts.txt rows
     NativeLayer nl;
     nl.layer = il;
+    if (exl3_) {   // EXL3: nine pieces an expert, as load_pack's layers
+        const auto xl = xt.layers.find(il);
+        if (xl == xt.layers.end()) {
+            err = "mtp: exl3.txt has no experts for blk." + std::to_string(il);
+            return false;
+        }
+        const Exl3Table::Layer& X = xl->second;
+        if (X.k[0] != g_.n_embd || X.n[0] != g_.n_ff_exp || X.k[2] != g_.n_ff_exp || X.n[2] != g_.n_embd) {
+            err = "mtp: the draft block's expert shapes disagree with the geometry";
+            return false;
+        }
+        nl.fmt.gu_type = nl.fmt.d_type = strata::kernels::exl3::kTypeEXL3;
+        nl.x_cb = X.cb;
+        for (int r = 0; r < 3; ++r) {
+            nl.x_K[r] = X.K[r];
+            nl.x_k[r] = X.k[r];
+            nl.x_n[r] = X.n[r];
+        }
+        nl.x_off = X.off;
+        nl.x_shard.resize(X.file.size());
+        for (size_t i = 0; i < X.file.size(); ++i) {
+            nl.x_shard[i] = exl3_shard0_ + X.file[i];
+            if (X.off[i] + nl.x_piece((int) (i % 9) / 3, (int) (i % 3)) > pack_shards_[(size_t) nl.x_shard[i]].size) {
+                err = "mtp: an expert of the draft block lies past the end of its file";
+                return false;
+            }
+        }
+        if (pack_layers_.size() < (size_t) il + 1) pack_layers_.resize((size_t) il + 1);
+        pack_layers_[(size_t) il] = std::move(nl);
+        if (pack_emb_src_ == nullptr) {
+            int se = -1;
+            const strata::TensorInfo* te = find("token_embd.weight", se);
+            if (te == nullptr) { err = "mtp: token_embd not found"; return false; }
+            pack_emb_src_ = src_of(te, se);
+            pack_emb_type_ = (int) te->type;
+        }
+        mtp_il_ = il;
+        std::fprintf(stderr, "glm mtp: CUDA%d the NextN block (blk.%d) loaded: %.0f MB dense, EXL3 experts K %d/%d/%d\n",
+                     dev_, il, (double) bytes / 1048576.0, X.K[0], X.K[1], X.K[2]);
+        return true;
+    }
     int sg = -1, su = -1, sd = -1;
     const strata::TensorInfo* tg = find(P + "ffn_gate_exps.weight", sg);
     const strata::TensorInfo* tu = find(P + "ffn_up_exps.weight", su);

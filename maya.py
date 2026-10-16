@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Project Maya - set up and start GLM-5.3-Flash on your own GPU(s).
-CUDA: Linux; Windows (experimental). HIP: experimental Linux gfx1100/gfx1201/gfx1151, text only.
+CUDA: Linux; Windows (experimental). HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not validated), Linux and
+Windows, text only.
 
     ./maya.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./maya.sh --setup         set up again (other GPUs, another context length, another model folder)
     ./maya.sh --check         only check this PC
     ./maya.sh --backend hip --gpu 0 --check    check an RX 7900 XT / XTX with system ROCm 7
 
-On Windows START-MAYA.bat takes the same options.  Both make the private Python environment (.venv, the way Strata's
-setup.sh does) and run this file.  It reuses Strata's installer (setup.py) for the PC checks,
-pip, llama.cpp's source and resumable downloads.
+On Windows START-MAYA.bat takes the same options.  Both make the private Python environment (.venv) and run this
+file.  Its helpers (setup.py) do the PC checks, pip, llama.cpp's source and resumable downloads.
 
 In a terminal the setup runs on a screen of its own (tools/setup_tui.py): the steps, what runs now with a progress
 bar, and the questions as menus - then Maya runs on the same screen, and every later start too: its dashboard (the
@@ -19,26 +19,30 @@ and Maya in the terminal as before; --yes: the setup in plain text.
 
 What the first run does (each step is skipped when it is already done):
 
-  1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+, driver, CUDA toolkit (nvcc), the C++ compiler (g++;
-     on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
+  1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+ (6.x, Pascal: experimental), driver, CUDA toolkit (nvcc),
+     the C++ compiler (g++; on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD
+     gfx1100/gfx1201/gfx1151 and ROCm 7 instead
+     (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
-     Maya-S24, Maya-M or Maya-L)
+     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits, experimental
+     and NVIDIA only)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
      and the size - and starts only after you answer y (or pass --download-model)
-  6. builds the pack (the engine's index of the GGUF files) inside the model folder
+  6. builds the pack (the engine's index of the model files) inside the model folder
   7. images: compiles the vision encoder (`build-vision/bin/strata-vision`) and fetches the model's vision files
      (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
   8. writes maya-<model>.json and run-maya-<model>.sh (.bat on Windows) - with the settings tuned for this PC
      earlier, or it offers the tuning (./maya.sh --calibrate does it any time) - and starts the dashboard on
      http://127.0.0.1:8080
 
-The tuning (tools/calibrate_glm.py, like Strata's --calibrate): decode speed measured with a few splits of the RAM-tier
-experts between the CPU and the PCIe link, and with fewer CPU threads, in one engine run (~10-15 minutes, the model
-loads first); a setting is kept when it is more than 3% faster than the engine's own choice.  The result goes into the
-config's "env" (STRATA_GLM_PCIE_SHARE, STRATA_GLM_CPU_LANE) and into ~/.config/project-maya/calibration.json for this
-PC, model and context, so a setup again keeps it.
+The tuning (tools/calibrate_glm.py): decode speed measured with a few splits of the RAM-tier
+experts between the CPU and the PCIe link, with fewer CPU threads, and - when part of the model is read from the SSD -
+with smaller disk reads, in one engine run (~10-15 minutes, the model loads first); a setting is kept when it is more
+than 3% faster than the engine's own choice.  The result goes into the config's "env" (STRATA_GLM_PCIE_SHARE,
+STRATA_GLM_CPU_LANE, STRATA_GLM_READ_CHUNKS) and into ~/.config/project-maya/calibration.json for this PC, model and
+context, so a setup again keeps it.
 
 Nothing is installed system-wide: a missing tool is reported with the command that installs it.
 """
@@ -62,6 +66,7 @@ sys.path.insert(0, str(HERE / "tools"))
 import setup as S  # noqa: E402  Strata's installer: PC checks, pip, llama.cpp, downloads (nothing runs on import)
 from setup import ask, fail, ok, run, say, step, warn  # noqa: E402
 import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./maya.sh --calibrate)
+import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
 
 WIN = S.WIN
 ME = "START-MAYA.bat" if WIN else "./maya.sh"      # how this is started, for the messages
@@ -73,12 +78,21 @@ STAMP = BUILD / "MAYA-BUILD.json"                  # what the engine in build/ w
 VBUILD = ROOT / "build-vision"
 VEXE = VBUILD / "bin" / ("strata-vision.exe" if WIN else "strata-vision")  # the image encoder (llama.cpp's mtmd)
 VSTAMP = VBUILD / "MAYA-BUILD.json"
-MIN_CC = 70                                        # Volta (V100) and newer (the GLM path; see arch_setting)
+MIN_CC = 60                                        # Pascal and newer (the GLM path; see arch_setting) ...
+VALIDATED_CC = 70                                  # ... Volta (V100) and newer validated, Pascal experimental (#212)
 MAX_GPUS = 16                                      # the layer split's parts at most (glm_model.hpp, kMaxParts)
 HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix Halo (unified memory)
+HIP_ARCHS_UNVALIDATED = ("gfx1030",)               # RDNA 2 (RX 6800 / 6900, Radeon PRO V620 / W6800), experimental: not
+                                                   # validated on a card; no matrix cores, the portable kernels; compiled
+                                                   # only when such a GPU is chosen
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
 DEFAULT_CONTEXT = 32768
+# KV streaming, on in every config (--kv-streaming on): the attention layers' latent cache lives in RAM and 32768
+# positions of each layer in VRAM (--kv-resident N, beside it, sets another window) - from a context above that (a
+# shorter one is not streamed); 12 KB of RAM a context token, 1.6 GB at 128K.  "--kv-streaming", "off" in the config's
+# args turns it off; a setup again keeps what the config says
+KV_STREAMING = "on"
 MODEL_NAME = "glm-5.3-flash"
 SAMPLING = {"temperature": 1.0, "top_p": 0.95}     # the dashboard's and the API's defaults for requests that set none
 EFFORT = "high"                                    # thinking level for requests that name none (GLM's High)
@@ -89,7 +103,8 @@ HF = "https://huggingface.co/{repo}/resolve/{revision}/{path}"
 # its top).  "file": the names on Hugging Face, with the quant label its file list groups (and adds up) them by -
 # one label per model; "was": the names they had there before (v1.0.18 and earlier: no label; v1.0.19: Maya-S24 as
 # IQ2_XXS, which Hugging Face added to Maya-S's) - a download under them is used as it is.  "sha256" per file name (the
-# Hugging Face one): every download is verified.  "vision": the image encoder's files (the mmproj,
+# Hugging Face one): every download is verified; a list holds every version published (v1.0.28: the first shards' header
+# names the architecture "glm5-next", as llama.cpp does - the data is the same, so a download of either is good).  "vision": the image encoder's files (the mmproj,
 # made from the official vision tower, and the tokenizer it reads its markers with) - from "repo" / "revision" when
 # it names them, else the model's own repo.
 MODELS = {
@@ -100,7 +115,8 @@ MODELS = {
         "file": "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 96.5,
         "sha256": {
             "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf":
-                "a507f2b7b25e04624ee55c631d3b281caea7cfffc747e5247970cd5a7ea91b3f",
+                ["e56ef50efd71d81ddf6249e08bd2ef5af96ed348c2b7a004491d46168d0ecaa7",    # "glm5-next" (v1.0.28)
+                 "a507f2b7b25e04624ee55c631d3b281caea7cfffc747e5247970cd5a7ea91b3f"],   # "glm5next", before
             "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00002-of-00003.gguf":
                 "2d65d88a69f8dc124c8d24bd33b33161ddab218918b4253ad4f500aeede84df5",
             "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00003-of-00003.gguf":
@@ -122,7 +138,8 @@ MODELS = {
                 "GLM-5.3-Flash-Maya-S24-{i:05d}-of-{n:05d}.gguf"], "shards": 3, "download_gb": 94.7,
         "sha256": {
             "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00001-of-00003.gguf":
-                "3dc347757686c1435eae36c4872f5c151191cc5063bc188ce699b97700aae076",
+                ["8ebd5c74bcf65ece2a8699b7b6fd2b8d177f350ed252cee252fdd99b86a0138c",
+                 "3dc347757686c1435eae36c4872f5c151191cc5063bc188ce699b97700aae076"],
             "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00002-of-00003.gguf":
                 "4bd445da3a0128a9c5b32228c924e0a622aa4a132c7a8dc9a2c207a4beea8e34",
             "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00003-of-00003.gguf":
@@ -143,12 +160,35 @@ MODELS = {
         "was": ["GLM-5.3-Flash-Maya-M-{i:05d}-of-{n:05d}.gguf"], "shards": 3, "download_gb": 116.0,
         "sha256": {
             "GLM-5.3-Flash-Maya-M-IQ2_S-00001-of-00003.gguf":
-                "3ac0f066ec45af3432d59b33de49bdfb29156432b627240b35769c7d02cc6c02",
+                ["3f740d1b1022b4a0ddad50cd861bb071dd415bde94afa1292d0476641186c638",
+                 "3ac0f066ec45af3432d59b33de49bdfb29156432b627240b35769c7d02cc6c02"],
             "GLM-5.3-Flash-Maya-M-IQ2_S-00002-of-00003.gguf":
                 "285951d2afa0cd98285b03d0dc4aa68d83daf1a6f4a2594fe40b0cdd27ade485",
             "GLM-5.3-Flash-Maya-M-IQ2_S-00003-of-00003.gguf":
                 "ebf1ce713f71207747e10eeebed87597969d8b5e1d9dd817420d2c2f7ca51e0e"},
         "vision": {
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # Maya-M with Blackfrost_AI's weight edit, in a repo of its own (the same label as Maya-M's: Hugging Face groups by
+    # it per repo); the vision files are Maya's, from the main repo
+    "Maya-M-Derisked": {
+        "about": "Maya-M-Derisked, Maya-M with a directional weight edit by Blackfrost_AI that reduces blanket "
+                 "refusals: the same IQ2_S quant, files and size, some of its weights changed (experimental)",
+        "repo": "peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF", "revision": "main", "folder": "",
+        "file": "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 116.0,
+        "sha256": {
+            "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00001-of-00003.gguf":
+                "da6a9755946f85a68aed34e80e86a7cf942f4ca637e605be81481979c871591e",
+            "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00002-of-00003.gguf":
+                "afc0705798bb293495168889a63186193fcd84e271aea3cde53c4814e9c96449",
+            "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00003-of-00003.gguf":
+                "e397c79669b84e8f54b7c946def0ea94f59771eecd7575766a3f70abfdd12157"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main",
             "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
             "download_gb": 1.14,
             "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
@@ -164,7 +204,8 @@ MODELS = {
         "was": ["GLM-5.3-Flash-Maya-L-{i:05d}-of-{n:05d}.gguf"], "shards": 4, "download_gb": 156.3,
         "sha256": {
             "GLM-5.3-Flash-Maya-L-IQ3_S-00001-of-00004.gguf":
-                "5fc82a6c9af4c6898e8d45cf32964f9a7b10640caf51e82be735d2d50e9f3d45",
+                ["c41aeaf3a3e0022150b7c355e7f4df6c92ba68c4794e3e827e02e56b54886b9e",
+                 "5fc82a6c9af4c6898e8d45cf32964f9a7b10640caf51e82be735d2d50e9f3d45"],
             "GLM-5.3-Flash-Maya-L-IQ3_S-00002-of-00004.gguf":
                 "351d59366afb7be7dfc3fb7af91281f7ccf00760b17dc45f82090325a7b34f64",
             "GLM-5.3-Flash-Maya-L-IQ3_S-00003-of-00004.gguf":
@@ -178,9 +219,192 @@ MODELS = {
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # turboderp's EXL3 (exllamav3) quants, read in place from their safetensors: the pack (tools/exl3_pack.py) puts a
+    # small GGUF of the unquantized tensors beside them.  "files": every file of the branch with its size (what is
+    # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.
+    "EXL3-3.05bpw": {
+        "about": "turboderp's EXL3 quant at 3.05 bits per weight (exllamav3's trellis format, which the engine reads "
+                 "in place from its safetensors), with the MTP draft block - experimental, NVIDIA GPUs only",
+        "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "3.05bpw",
+        "revision": "332ab457b709b7ba30dd9a448be5de03b80a7ac9", "folder": "", "download_gb": 125.3,
+        "files": {
+            "config.json": 86509, "LICENSE": 1070, "README.md": 7238, "chat_template.jinja": 8617,
+            "generation_config.json": 194, "kpool_aux.safetensors": 11548768,
+            "model-00001-of-00015.safetensors": 8589636152, "model-00002-of-00015.safetensors": 8588356452,
+            "model-00003-of-00015.safetensors": 8590179904, "model-00004-of-00015.safetensors": 8588365508,
+            "model-00005-of-00015.safetensors": 8588365508, "model-00006-of-00015.safetensors": 8588365500,
+            "model-00007-of-00015.safetensors": 8590186912, "model-00008-of-00015.safetensors": 8588365508,
+            "model-00009-of-00015.safetensors": 8588365508, "model-00010-of-00015.safetensors": 8588365500,
+            "model-00011-of-00015.safetensors": 8590186912, "model-00012-of-00015.safetensors": 8588365508,
+            "model-00013-of-00015.safetensors": 8588365508, "model-00014-of-00015.safetensors": 8590694168,
+            "model-00015-of-00015.safetensors": 2059162376, "model.safetensors.index.json": 15960981,
+            "mtp.safetensors": 2862645889, "processor_config.json": 909, "quantization_config.json": 47905678,
+            "tokenizer.json": 20217442, "tokenizer_config.json": 761},
+        "sha256": {
+            "config.json":
+                "0bef79e79b28fa9c51d57c49bd53adc59005c916832879ad3f0862e284a7bc06",
+            "LICENSE":
+                "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1",
+            "README.md":
+                "4f46db37e6a7cbe3a494d6d7f616a96f4fffe6d1de68be361199a715c8d928fc",
+            "chat_template.jinja":
+                "41cff9af7b3a86c96751b107a8444f245fbda0bd5320b636a5bb1f7f4ba1a5c3",
+            "generation_config.json":
+                "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+            "kpool_aux.safetensors":
+                "39053cd051c75e81b7e608818111a4b4c3c57da540599089419fe11b51ca02d3",
+            "model-00001-of-00015.safetensors":
+                "6b6b96190a5114a55d058e3f4ae8a4350ac334dfcf804f61c39d5c6e40340ba4",
+            "model-00002-of-00015.safetensors":
+                "29fda4953918a156758169afa120929fdd35407860eddf5cad0cb747f65475ed",
+            "model-00003-of-00015.safetensors":
+                "9844130df84df3138706a0a708775c8d010a7ed370539880e327cac6bec7f2b7",
+            "model-00004-of-00015.safetensors":
+                "4f2a6fb68fb6cceab231d9c4a54b96174b4ec2b1bbf5cf042a6e4be37c739e29",
+            "model-00005-of-00015.safetensors":
+                "73cd6d0b5ba7f6d0ce23982729c6342d38114dd89d8a884a2fa08133ef52b47a",
+            "model-00006-of-00015.safetensors":
+                "160fcfc258b61c7aa7cbc27c4d6a33daee8bfe6dbb0e7dd5e73ce901789f391e",
+            "model-00007-of-00015.safetensors":
+                "a94f480c4256b7e5311b5384574471caff4f4fc0def8c3e1c57c411222cb1ce4",
+            "model-00008-of-00015.safetensors":
+                "e513ba853f8b8cb7dac8f17ff9f281787a63cc67daea15fc288591f93eec62f5",
+            "model-00009-of-00015.safetensors":
+                "825928573f534c09dc8e157356359bc525e883933777fa0d09d7a30a3f13d8b0",
+            "model-00010-of-00015.safetensors":
+                "f82170395c010c1b40b3695bcca439ac54445b268936ee71eb48c28f347d0d0d",
+            "model-00011-of-00015.safetensors":
+                "240ece46708e5c41aaf365bb2659ed7da2134bc12d9fa9b5393555c103228c6f",
+            "model-00012-of-00015.safetensors":
+                "2738042b40d05e144e54ed3c1013831d7dc156b694a1d68a49d55b25369ac8d9",
+            "model-00013-of-00015.safetensors":
+                "cf097956efdf8c307a6e560786445f1715c7bba9b2bddfb300f7346b1e1eb3ba",
+            "model-00014-of-00015.safetensors":
+                "1add7e6d8f4866e5aeecf77ac9ca2aacce3f071455fa9c167fa9bc678551c923",
+            "model-00015-of-00015.safetensors":
+                "d14a0087710b04a680f2d2a8769fa26f4e53dd3c1d5ce5391798ba25da1947f4",
+            "model.safetensors.index.json":
+                "559538d5006f757c809ef0a545062c2f79abb0140667399d590af0da96f26735",
+            "mtp.safetensors":
+                "7274f06d75842edfa258830c836fd790a19324513134e05cd1e931929c4c384d",
+            "processor_config.json":
+                "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+            "quantization_config.json":
+                "308d9a4b28407e2ada887f512bc8793c608586a73d9e0108ca258220ac714280",
+            "tokenizer.json":
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            "tokenizer_config.json":
+                "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
+        # the pictures: the vision tower and its tokenizer are the same in every GLM-5.3-Flash quant
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
+            "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # the same at 4.05 bits: 4-bit routed experts (3-bit at 3.05), mostly 6-bit dense weights; the indexer's kpool
+    # tensors are in its shards (3.05bpw has them in kpool_aux.safetensors)
+    "EXL3-4.05bpw": {
+        "about": "turboderp's EXL3 quant at 4.05 bits per weight (exllamav3's trellis format, which the engine reads "
+                 "in place from its safetensors), with the MTP draft block - experimental, NVIDIA GPUs only",
+        "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "4.05bpw",
+        "revision": "2a30229e67012798ba9f0cd832bb78abf4c363d5", "folder": "", "download_gb": 165.2,
+        "files": {
+            "config.json": 86509, "LICENSE": 1070, "README.md": 7238, "chat_template.jinja": 8617,
+            "generation_config.json": 194, "model-00001-of-00019.safetensors": 8587818716,
+            "model-00002-of-00019.safetensors": 8587936824, "model-00003-of-00019.safetensors": 8590375904,
+            "model-00004-of-00019.safetensors": 8590340084, "model-00005-of-00019.safetensors": 8590383216,
+            "model-00006-of-00019.safetensors": 8587986708, "model-00007-of-00019.safetensors": 8590342372,
+            "model-00008-of-00019.safetensors": 8590383800, "model-00009-of-00019.safetensors": 8587944528,
+            "model-00010-of-00019.safetensors": 8590383896, "model-00011-of-00019.safetensors": 8590342356,
+            "model-00012-of-00019.safetensors": 8590383392, "model-00013-of-00019.safetensors": 8587986540,
+            "model-00014-of-00019.safetensors": 8590342372, "model-00015-of-00019.safetensors": 8590383888,
+            "model-00016-of-00019.safetensors": 8590341500, "model-00017-of-00019.safetensors": 8587986956,
+            "model-00018-of-00019.safetensors": 8590342372, "model-00019-of-00019.safetensors": 6661824340,
+            "model.safetensors.index.json": 15963650, "mtp.safetensors": 3793519833, "processor_config.json": 909,
+            "quantization_config.json": 47905678, "tokenizer.json": 20217442, "tokenizer_config.json": 761},
+        "sha256": {
+            "config.json":
+                "df80c17a68120aeae4c1eca8a9aa67866603484f0487cd5458c08dfd3c45156d",
+            "LICENSE":
+                "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1",
+            "README.md":
+                "4f46db37e6a7cbe3a494d6d7f616a96f4fffe6d1de68be361199a715c8d928fc",
+            "chat_template.jinja":
+                "41cff9af7b3a86c96751b107a8444f245fbda0bd5320b636a5bb1f7f4ba1a5c3",
+            "generation_config.json":
+                "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+            "model-00001-of-00019.safetensors":
+                "1c7a87b0fb108521d0cf3e495ca63c37732a06744131e8933ca12d2df0d8806e",
+            "model-00002-of-00019.safetensors":
+                "a67cd8e559ac013fc0d1dc58b66bd105e54bee0a31147b295089b2537646d4dc",
+            "model-00003-of-00019.safetensors":
+                "d069cea25c6082a70b2dbc601725687f8d164a5dd047894acb58476b4175c1af",
+            "model-00004-of-00019.safetensors":
+                "d222d3137bec069a165219542d49d02defef2df69763464e93463a176e2ba935",
+            "model-00005-of-00019.safetensors":
+                "6fdd4557f29e1b77248b6bbd6b35c691ef4b1dc63b7305c9f5cb0080e1c82836",
+            "model-00006-of-00019.safetensors":
+                "3e9c1f39a631dedd5cce7614947d1f3eab71c93dbb4c79bd2eec0ab413236055",
+            "model-00007-of-00019.safetensors":
+                "62eca4decce10159107948a320083d8e9dcf60f25e058877a1662b80f1412220",
+            "model-00008-of-00019.safetensors":
+                "e8f8762fa1c6a698fc74d50760b82ec72d6043fb9ef6e05dac4032999f57d7c5",
+            "model-00009-of-00019.safetensors":
+                "f9d2e2df7fc7a65c33514a584e5a228d5eb4bec72fc516d9c649c94b06e3d00e",
+            "model-00010-of-00019.safetensors":
+                "5eb19bda8461e44323898172492f9f5c948f5c8ad00816b0e004feaf8b11ccfa",
+            "model-00011-of-00019.safetensors":
+                "f2e687a3d410af6bd48f90d5770fac1054ad5c337d3cfa2bd56a5600387ba36a",
+            "model-00012-of-00019.safetensors":
+                "caee2cdd11e781195a3bbb70b53da0c08c4add3485e200a4a28119d238201523",
+            "model-00013-of-00019.safetensors":
+                "094d5b9341505d25852993e0eef6d137ba75c4179bec2204bd067af264da5dd1",
+            "model-00014-of-00019.safetensors":
+                "765f21794314da81bccdf6a1c9b3fff3f86711d34d83f7551667455a9775dc1a",
+            "model-00015-of-00019.safetensors":
+                "f08d208c8ad27b3bb9c75c42c90e33a3e8acd722ccf5f4f74df1638084d46067",
+            "model-00016-of-00019.safetensors":
+                "e4c0bbf93639fd96eddb9a38505c4de99d650f82d376c0e303a7c3fd38544c3d",
+            "model-00017-of-00019.safetensors":
+                "8e954f3e1660889a50974f46e66ad75a4e3bcadb0398a91646d58a09d9c2f54c",
+            "model-00018-of-00019.safetensors":
+                "bad6f1e51e7bd25a4da4fe55efe4f91512bf4e82085db2baa5cce1adea027c58",
+            "model-00019-of-00019.safetensors":
+                "de2031315b49f89e3d091e92bead8b239ea46e304236f34b5734a68b0b07d547",
+            "model.safetensors.index.json":
+                "ee1f2dbea800dea0b4225c38193f7ef41180ed42dd51f80a0cee58daf44cf606",
+            "mtp.safetensors":
+                "1bd09bd4eff4adc568e4ac3e92efb436c2d3aa5f0dceab4c72005d796066822d",
+            "processor_config.json":
+                "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+            "quantization_config.json":
+                "d18c35bf6184a67a3b612b15c216bdfdf9e81505c0e02b646152925b13fafef3",
+            "tokenizer.json":
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            "tokenizer_config.json":
+                "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
+            "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
 }
+# The DFlash2 drafter the setup offers instead of drafting with the model's MTP block (--dflash): a small block drafter
+# made for GLM-5.3-Flash (any of the quants above), pinned to the revision it was measured with and verified.
+DFLASH = {"repo": "Anbeeld/GLM-5.3-Flash-DFlash2-GGUF", "revision": "f3569acb7f9cee95e66d24442d75536eb00ab842",
+          "file": "GLM-5.3-Flash-DFlash2-Q4_K_M.gguf", "bytes": 697017248,
+          "sha256": "f4158ffb805b26c4fe439669c2009908a80ea89e1576ecea4d03eaded18f017c",
+          "license": "CC BY-NC-ND 4.0"}   # (the repo's: non-commercial use only, shown wherever it is offered)
+DRAFTS = ("mtp", "dflash2")                        # the setup's drafting choices; MTP the default
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
+# the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
+# its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
+PROFILE = ROOT / "data" / "expert-profile-glm.bin"
 PACK_FILES = ("index.txt", "native_experts.txt", "dense.bin", "tokenizer/vocab.json", "tokenizer/merges.txt",
               "tokenizer/token_type.json", "tokenizer/chat_template.jinja")
 
@@ -199,12 +423,32 @@ def read_json(path: Path) -> dict:
 
 
 def configs() -> list:
-    """The installed models' configs, the most recently used first."""
-    return sorted(ROOT.glob("maya-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    """The installed models' configs, the most recently used first - not the dashboard's settings the server keeps
+    beside each (<config>.shared-settings.json), which a restart took for a config of the CUDA backend."""
+    return sorted((p for p in ROOT.glob("maya-*.json") if not p.name.endswith(".shared-settings.json")),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def zfs_arc_gb(path: str = "/proc/spl/kstat/zfs/arcstats") -> float:
+    """What ZFS's ARC holds above its floor (c_min), in GiB: it gives that back under pressure, as the page cache does,
+    but MemAvailable leaves it out (#89); 0 without ZFS."""
+    vals = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 3 and p[0] in ("size", "c_min") and p[2].isdigit():
+                    vals[p[0]] = int(p[2])
+    except OSError:
+        return 0.0
+    if "size" not in vals or "c_min" not in vals:
+        return 0.0
+    return max(0, vals["size"] - vals["c_min"]) / 2**30
 
 
 def mem_gb() -> tuple:
-    """(total, available) RAM in GiB - the engine sizes its RAM tier from MemAvailable (on Windows ullAvailPhys)."""
+    """(total, available) RAM in GiB - the engine sizes its RAM tier from MemAvailable and ZFS's reclaimable ARC (on
+    Windows ullAvailPhys)."""
     if WIN:
         m = S._memory_status()
         return m.ullTotalPhys / 2**30, m.ullAvailPhys / 2**30
@@ -216,7 +460,8 @@ def mem_gb() -> tuple:
                 info[k] = int(v.split()[0]) * 1024 / 2**30
     except (OSError, ValueError):
         pass
-    return info.get("MemTotal", 0.0), info.get("MemAvailable", 0.0)
+    avail = info.get("MemAvailable", 0.0)
+    return info.get("MemTotal", 0.0), avail + zfs_arc_gb() if avail > 0 else avail
 
 
 def existing(path: Path) -> Path:
@@ -288,22 +533,130 @@ def select_build_backend(backend: str) -> None:
 
 
 def hip_unified_memory(g) -> bool:
-    # gfx1151 is Strix Halo, even when KFD/sysfs has no product name or reports
+    # gfx1151 is Strix Halo / Gorgon Halo, even when KFD/sysfs has no product name or reports
     # only a tiny firmware VRAM carve-out. This is independent of vram_gb.
     return g.get("arch") == "gfx1151" or bool(g.get("integrated")) or bool(
-        re.search(r"Ryzen AI Max|Radeon\s+(?:8050S|8060S)", g.get("name", ""), re.I))
+        re.search(r"Ryzen AI Max|Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", g.get("name", ""), re.I))
 
 
-def check_hip_pc(a) -> dict:
-    if WIN or not sys.platform.startswith("linux") or S.is_wsl():
-        fail("Maya's experimental HIP backend requires native Linux")
-    found = S.amd_gpus()
-    usable = [g for g in found if g["arch"] in HIP_ARCHS]
+def hip_clang(root: Path) -> Path | None:
+    """ROCm's clang++: <root>/llvm/bin (a system ROCm on Linux), <root>/lib/llvm/bin (TheRock's wheels), or <root>/bin
+    (AMD's HIP SDK for Windows)."""
+    exe = "clang++.exe" if WIN else "clang++"
+    return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe, root / "bin" / exe)
+                 if p.exists()), None)
+
+
+def rocm_sdk() -> str | None:
+    """TheRock's rocm-sdk (AMD's ROCm wheels for Windows): ROCM_VENV's, this .venv's, else the one on PATH."""
+    venv = os.environ.get("ROCM_VENV")
+    for c in (venv and str(Path(venv) / "Scripts" / "rocm-sdk.exe"), venv_tool("rocm-sdk"), shutil.which("rocm-sdk")):
+        if c and Path(c).exists():
+            return c
+    return None
+
+
+def windows_rocm() -> tuple:
+    """(ROCm's root, the folder of its DLLs) on Windows, or (None, None): ROCM_PATH, else TheRock's wheels, else AMD's
+    HIP SDK for Windows (HIP_PATH, which its installer sets, else the newest in C:\\Program Files\\AMD\\ROCm)."""
+    if os.environ.get("ROCM_PATH"):
+        root = Path(os.environ["ROCM_PATH"]).resolve()
+        return root, root / "bin"
+    sdk = rocm_sdk()
+    if sdk is not None:
+        # the first `rocm-sdk init` unpacks the compiler, the headers and the libraries (about 3 GB, minutes) and links
+        # the device wheels in; later ones only check. Before any `rocm-sdk path`: that would unpack it too, unseen and
+        # within S.out's minute, and start over on every run (as llama.cpp's Windows CI does: init, then path)
+        say("  AMD's ROCm SDK: rocm-sdk init (the first time it unpacks about 3 GB) ...")
+        run([sdk, "init"], check=False)
+        path = lambda what: (S.out([sdk, "path", what]).strip().splitlines() or [""])[-1].strip()
+        root = path("--root")
+        if root:
+            return Path(root), Path(path("--bin") or Path(root) / "bin")
+    base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "AMD" / "ROCm"
+    sdks = sorted(base.glob("[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)], reverse=True)
+    for root in ([Path(os.environ["HIP_PATH"])] if os.environ.get("HIP_PATH") else []) + sdks:
+        if hip_clang(root) is not None:
+            return root.resolve(), root.resolve() / "bin"
+    return None, None
+
+
+def rocm_devices_missing(archs) -> list:
+    """Of these architectures, those whose library kernels (TheRock's rocm-sdk-device-<arch> wheel) are not in this
+    .venv; [] for a ROCm SDK elsewhere (ROCM_PATH, ROCM_VENV, PATH: not checked)."""
+    if os.environ.get("ROCM_PATH") or rocm_sdk() is None or rocm_sdk() != venv_tool("rocm-sdk"):
+        return []
+    from importlib import invalidate_caches, metadata
+    invalidate_caches()
+    missing = []
+    for arch in dict.fromkeys(archs):
+        try:
+            metadata.version(f"rocm-sdk-device-{arch}")
+        except metadata.PackageNotFoundError:
+            missing.append(arch)
+    return missing
+
+
+def hip_info(bindir) -> str | None:
+    """ROCm's hipInfo (on Windows: lists the GPUs as HIP numbers them, with their architecture)."""
+    p = Path(bindir) / "hipInfo.exe" if bindir else None
+    return str(p) if p and p.exists() else shutil.which("hipInfo")
+
+
+THEROCK_INDEX = "https://repo.amd.com/rocm/whl-multi-arch/"   # AMD's ROCm for Windows: TheRock's pip wheels
+THEROCK_VERSION = "7.14.1"                                     # 7.14: the first with Gorgon Halo (Ryzen AI Max 400)
+
+
+def rocm_pip(archs) -> list:
+    """pip's command that puts AMD's ROCm SDK for these GPUs into this Python (.venv): the compiler, the libraries and
+    their kernels for each architecture."""
+    devices = ",".join(f"device-{x}" for x in sorted(set(archs)))
+    return [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--index-url", THEROCK_INDEX,
+            f"rocm[libraries,devel,{devices}]=={THEROCK_VERSION}"]
+
+
+def install_rocm(a, chosen) -> None:
+    """Windows: AMD's ROCm SDK with the kernels for these GPUs into Maya's .venv (asked first; nothing goes outside
+    this folder), else the command."""
+    archs = sorted({g["arch"] for g in chosen})
+    cmd = rocm_pip(archs)
+    what = f"AMD's ROCm SDK for Windows with the kernels for {', '.join(archs)}"
+    if getattr(a, "check", False) or sys.prefix == sys.base_prefix:
+        fail(f"{what} is not installed", f"install it into Maya's Python environment: {cmdline(cmd)}"
+             f" - then run {ME} again (or set ROCM_PATH / ROCM_VENV to a ROCm 7 that has one)")
+    if ask(f"Install {what} ({THEROCK_VERSION}) into .venv now (pip, from repo.amd.com)?",
+           ["y", "n"], "y", getattr(a, "yes", False)) != "y":
+        fail("Maya's HIP engine is compiled with AMD's ROCm SDK", f"install it with: {cmdline(cmd)}")
+    run(cmd)
+    if windows_rocm()[0] is None:
+        fail("pip installed AMD's ROCm SDK, but rocm-sdk does not answer", f"run {cmdline(cmd)} again and check its "
+             "messages")
+
+
+def check_hip_pc(a, installed=False) -> dict:
+    if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
+        fail("Maya's experimental HIP backend runs on native Linux or Windows")
+    if WIN and S.find_vcvars(cuda=False) is None:      # (before ROCm's download: ROCm's clang needs its headers)
+        fail("Visual Studio Build Tools (2022 or 2026) are needed: ROCm's compiler uses their headers and libraries",
+             "winget install -e --id Microsoft.VisualStudio.2022.BuildTools --override \"--wait --passive --add "
+             "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\" - or "
+             "https://visualstudio.microsoft.com/visual-cpp-build-tools/ with 'Desktop development with C++'")
+    root, bindir = windows_rocm() if WIN else (None, None)
+    hipinfo = hip_info(bindir) if WIN else None
+    found = S.amd_gpus(hipinfo) if WIN else S.amd_gpus()
+    usable = [g for g in found if g["arch"] in HIP_ARCHS + HIP_ARCHS_UNVALIDATED]
     for g in found:
         say(f"    {gpu_label(g)} - " + ("can be used" if g in usable else "not supported by Maya's HIP build"))
     if not usable:
         fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100), RX 9070 / AI PRO R9700 "
-             "(gfx1201), and Strix Halo / Radeon 8060S (gfx1151)")
+             "(gfx1201), and Strix Halo / Gorgon Halo, Radeon 8050S / 8060S / 8065S (gfx1151); experimental, not "
+             "validated: RX 6800 / 6900, Radeon PRO V620 / W6800 (gfx1030)")
+    if WIN and hipinfo and all(g.get("source") == "registry" for g in found):
+        warn(f"ROCm's hipInfo sees no AMD GPU (the list above is Windows'): the engine cannot start until it does - "
+             f"update AMD's driver (AMD Software: Adrenalin Edition, https://www.amd.com/en/support), restart, and "
+             f"check with {hipinfo}")
+    elif WIN and len(found) > 1 and any(g.get("source") == "registry" for g in found):
+        warn("these GPU numbers are Windows' order (ROCm's hipInfo was not found): HIP's own can differ")
     if a.gpus:
         # two cards split the layers (each caches the experts of its own half); the larger card goes first, as it
         # takes the bigger first half - the order measured on an R9700 + RX 7900 XT
@@ -317,30 +670,48 @@ def check_hip_pc(a) -> dict:
         for i, g in zip(want, picked):
             if g is None:
                 fail(f"GPU {i} is not a supported AMD card")
-        apu = next((g for g in picked if hip_unified_memory(g)), None)
-        if apu is not None:
-            fail(f"GPU {apu['index']} ({apu['name']}) is an APU with unified memory, which stays single-GPU",
-                 "use --gpu N for it, or pick two discrete cards with --gpus")
-        chosen = sorted(picked, key=lambda g: -g["vram_gb"])
+        # A mixed pair puts the discrete GPU first and the unified-memory APU last.
+        chosen = sorted(picked, key=lambda g: (hip_unified_memory(g), -g["vram_gb"]))
     else:
         one = next((g for g in usable if g["index"] == a.gpu), None) if a.gpu is not None else max(
             usable, key=lambda g: g["vram_gb"])
         if one is None:
             fail(f"GPU {a.gpu} is not a supported AMD card")
         chosen = [one]
-    root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
-    if not os.environ.get("ROCM_PATH") and not root.exists():
-        # versioned installs without the /opt/rocm link (e.g. /opt/rocm-7.2.2): the newest one
-        versions = sorted(Path("/opt").glob("rocm-[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
-        if versions:
-            root = versions[-1]
-    root = root.resolve()
-    if not (root / "llvm/bin/clang++").exists() or not list((root / "lib").glob("libhipblas.so*")):
-        fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
-    if tool_version(str(root / "bin/hipcc")) < (7, 0):
-        fail("Maya's HIP port requires ROCm 7 or newer")
-    if not shutil.which("c++"):
-        fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
+    if WIN:
+        # no ROCm SDK, or Maya's without the library kernels (rocm-sdk-device-<arch>) for a chosen GPU: offered once,
+        # then checked again with ROCm there (its hipInfo numbers the GPUs as HIP does)
+        missing = sorted({g["arch"] for g in chosen}) if root is None else rocm_devices_missing(g["arch"] for g in chosen)
+        if missing and not installed and (root is None or not getattr(a, "check", False)):   # (--check: says so below)
+            install_rocm(a, chosen)
+            return check_hip_pc(a, installed=True)
+        if root is None:
+            fail("AMD's ROCm SDK for Windows was not found after its install", f"run {ME} again")
+        if missing:
+            warn(f"the ROCm SDK still has no library kernels for {', '.join(missing)} (rocm-sdk-device-...): hipBLAS "
+                 f"fails on that GPU - {cmdline(rocm_pip(g['arch'] for g in chosen))}")
+        if hip_clang(root) is None or not (list(root.glob("lib/hipblas*.lib")) or list(bindir.glob("hipblas*.dll"))):
+            fail(f"ROCm's HIP compiler and hipBLAS are not in {root}",
+                 f"install AMD's ROCm SDK into Maya's .venv: {cmdline(rocm_pip(g['arch'] for g in chosen))} - or set "
+                 "ROCM_PATH to the root of a ROCm 7 for Windows")
+        hipcc = next((p for p in (bindir / "hipcc.exe", root / "bin" / "hipcc.exe") if p.exists()), None)
+        if hipcc is not None and tool_version(str(hipcc)) < (7, 0):
+            fail("Maya's HIP port requires ROCm 7 or newer")
+    else:
+        root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
+        if not os.environ.get("ROCM_PATH") and not root.exists():
+            # versioned installs without the /opt/rocm link (e.g. /opt/rocm-7.2.2): the newest one
+            versions = sorted(Path("/opt").glob("rocm-[0-9]*"),
+                              key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)])
+            if versions:
+                root = versions[-1]
+        root = root.resolve()
+        if not (root / "llvm/bin/clang++").exists() or not list((root / "lib").glob("libhipblas.so*")):
+            fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
+        if tool_version(str(root / "bin/hipcc")) < (7, 0):
+            fail("Maya's HIP port requires ROCm 7 or newer")
+        if not shutil.which("c++"):
+            fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
     cpu, avx2, avx512 = S.cpu_info()
     if not avx2:
         fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
@@ -349,16 +720,32 @@ def check_hip_pc(a) -> dict:
        f"{'two GPUs (layer split)' if len(chosen) == 2 else 'one GPU'}, text only")
     ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
-    if any(hip_unified_memory(g) for g in chosen):
+    if any(hip_unified_memory(g) for g in chosen) and WIN:
+        # Windows gives the APU's GPU a fixed carve-out, which it does not count as RAM: the engine sizes the pool
+        # from it as on a discrete card (src/core/glm_fast_path.cu, fast_setup)
+        vram = sum(g["vram_gb"] for g in chosen)
+        ok(f"APU: {vram:.0f} GB of the memory is the GPU's (Windows' share for it): the engine fills it with experts "
+           "and keeps the next ones in RAM")
+        if vram < total:
+            warn(f"the GPU has {vram:.0f} GB and Windows {total:.0f} GB: set Variable Graphics Memory higher (AMD "
+                 "Software: Performance > Tuning, or the iGPU memory size in the BIOS), e.g. 96 GB on a 128 GB PC, "
+                 "and restart - the experts on the GPU are the fastest")
+    elif any(hip_unified_memory(g) for g in chosen):
         ok("APU / unified memory: the engine sizes the GPU expert pool from available system RAM")
+    unvalidated = sorted({g["arch"] for g in chosen if g["arch"] in HIP_ARCHS_UNVALIDATED})
+    if unvalidated:
+        warn(f"{', '.join(unvalidated)} (RDNA 2) is experimental: it builds and has the portable kernels, but Maya has "
+             "not been validated on such a card yet - please report how it goes in an issue "
+             "(https://github.com/mw00/project-maya/issues)")
     select_build_backend("hip")
-    return {"backend": "hip", "gpus": chosen, "archs": list(HIP_ARCHS), "rocm": str(root)}
+    return {"backend": "hip", "gpus": chosen, "archs": list(HIP_ARCHS) + unvalidated, "rocm": str(root),
+            **({"rocm_bin": str(bindir)} if WIN else {})}
 
 
 def nvcc_range(archs) -> tuple:
     """The CUDA toolkit versions that can build for these GPUs: (lowest, first too new or None)."""
     lo = (12, 8) if max(archs) >= 100 else (12, 0)  # Blackwell needs 12.8
-    hi = (13, 0) if min(archs) < 75 else None       # CUDA 13 no longer compiles for Volta (sm_70)
+    hi = (13, 0) if min(archs) < 75 else None       # CUDA 13 no longer compiles for Volta (sm_70) or Pascal (sm_6x)
     return lo, hi
 
 
@@ -398,9 +785,10 @@ def toolkit_hint(archs) -> str:
     if WIN:
         return ("NVIDIA's CUDA Toolkit 12.8 for Windows (the driver can stay as it is): "
                 "https://developer.nvidia.com/cuda-12-8-0-download-archive" +
-                (" - Volta (V100) needs 12.x, CUDA 13 dropped it" if min(archs) < 75 else ""))
+                (" - Volta (V100) and Pascal need 12.x, CUDA 13 dropped them" if min(archs) < 75 else ""))
     if min(archs) < 75:
-        return ("Volta (V100) needs CUDA 12.x - Ubuntu 24.04: sudo apt-get install -y nvidia-cuda-toolkit (CUDA 12.0), "
+        return ("Volta (V100) and Pascal need CUDA 12.x - Ubuntu 24.04: sudo apt-get install -y nvidia-cuda-toolkit "
+                "(CUDA 12.0), "
                 "or NVIDIA's cuda-toolkit-12-8 package: https://developer.nvidia.com/cuda-12-8-0-download-archive")
     if max(archs) >= 100:
         return "NVIDIA's cuda-toolkit-12-8 (or newer) package: https://developer.nvidia.com/cuda-downloads"
@@ -439,7 +827,9 @@ def choose_gpus(a, found) -> list:
                      "use one of: " + ", ".join(str(g["index"]) for g in usable))
         return [byid[i] for i in want]
     if not usable:
-        fail("none of the GPUs can run Maya", "it needs an NVIDIA GPU of compute capability 7.0 or newer (V100 and newer)")
+        fail("none of the GPUs can run Maya",
+             "it needs an NVIDIA GPU of compute capability 7.0 or newer (V100 and newer; "
+             "Pascal - Tesla P40 / P100, GTX 10 - is experimental)")
     best = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
     if len(best) == 1:
         return best
@@ -473,7 +863,7 @@ def check_pc(a) -> dict:
     if WIN:
         warn("Windows support is new (experimental): Maya is developed and measured on Linux - tell us how it runs")
     if S.is_wsl():
-        warn("this is WSL2, which Maya does not support: Strata measured that WSL2's driver pins only about 1 GB of "
+        warn("this is WSL2, which Maya does not support: WSL2's driver pins only about 1 GB of "
              "RAM for the GPU, and Maya's RAM tier pins tens of GB. Use a native Linux install.")
     found = S.gpus()
     if not found:
@@ -482,8 +872,9 @@ def check_pc(a) -> dict:
               "install the NVIDIA driver (Ubuntu: sudo ubuntu-drivers install)") + f", restart, and run {ME} again")
     say("  NVIDIA GPUs:")
     for g in found:
-        say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= MIN_CC else
-                                       "too old (Maya needs compute capability 7.0 or newer)"))
+        say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= VALIDATED_CC else
+                                       "can be used (Pascal: experimental)" if int(g["arch"]) >= MIN_CC else
+                                       "too old (Maya needs compute capability 6.0 or newer)"))
     chosen = choose_gpus(a, found)
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
@@ -492,11 +883,16 @@ def check_pc(a) -> dict:
     if vram < 23:
         say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
             "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
+    if min(archs) < VALIDATED_CC:
+        warn("Pascal (compute capability 6.x) is experimental: the engine builds for it with its portable kernels "
+             "(the prompt attention on the F32 cores) and caches global loads in L1 there, but Maya has not been "
+             "validated on such a card yet - tell us how it goes in an issue")
     problems = []                                      # (what is wrong, how to fix it): all of them at once
 
     nvcc, nv = find_nvcc(archs, a.nvcc)
     lo, hi = nvcc_range(archs)
-    want = f"CUDA {lo[0]}.{lo[1]} or newer" + (f" but older than {hi[0]}.0 (CUDA 13 dropped Volta)" if hi else "")
+    want = f"CUDA {lo[0]}.{lo[1]} or newer" + (
+        f" but older than {hi[0]}.0 (CUDA 13 dropped Volta and Pascal)" if hi else "")
     if nvcc is None:
         problems.append((f"the CUDA toolkit (nvcc) is not installed; these GPUs need {want}", toolkit_hint(archs)))
     elif nv is None:
@@ -589,7 +985,14 @@ def choose_context(a, prev_ctx) -> int:
 
 
 def shard_names(m: dict, pattern: str | None = None) -> list:
+    """A download's files under their names on Hugging Face: a GGUF's shards, or an EXL3 model's every file."""
+    if "files" in m and pattern is None:
+        return list(m["files"])
     return [(pattern or m["file"]).format(i=i, n=m["shards"]) for i in range(1, m["shards"] + 1)]
+
+
+def is_exl3(quant: str) -> bool:
+    return MODELS.get(quant, {}).get("format") == "exl3"
 
 
 def old_names(m: dict) -> list:
@@ -627,6 +1030,33 @@ def download_dir(models: Path, quant: str) -> Path:
     return d
 
 
+def choose_draft(a, pc: dict, inst: dict) -> str:
+    """"mtp" (the model's own MTP block; the default) or "dflash2" (a DFlash2 drafter, downloaded in step 5): --draft,
+    else asked - the earlier setup's answer is the default.  AMD (HIP) setups keep MTP: DFlash2 is measured on NVIDIA.
+    So do NVIDIA GPUs before sm_80 (RTX 30 / A100): on Tesla V100s DFlash2 decoded slower than the MTP block (one GPU
+    and two).  A DFlash2 answer is then checked on this PC by the speed calibration (speed_calibration): it stays only
+    where it is faster."""
+    if getattr(a, "draft", None):
+        return a.draft
+    if pc.get("backend") == "hip":
+        return "mtp"
+    if pc.get("archs") and min(int(x) for x in pc["archs"]) < 80:
+        return "mtp"
+    default = inst.get("draft") if inst.get("draft") in DRAFTS else "mtp"
+    rows = [("the model's MTP block", "default",
+             "The model's own draft block guesses the next token, which the model then checks. On two GPUs or "
+             "more; one GPU decodes without drafting."),
+            (f"a DFlash2 drafter (download {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face)", None,
+             "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks: the "
+             "same answers, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one "
+             "RTX 3090. A speed calibration then measures it against the MTP block on this PC (5-20 minutes) and "
+             "keeps it only if it is faster here. The drafter's license is "
+             f"{DFLASH['license']}: non-commercial use only.")]
+    pick = choose("Drafting?", ["How the model drafts tokens ahead (the answers are the same either way):"], rows,
+                  DRAFTS.index(default), a.yes)
+    return DRAFTS[pick]
+
+
 def choose_model(a, models: Path, inst: dict) -> tuple:
     """("download", one of MODELS) or ("local", the model's first .gguf file): --gguf-dir, --model, else asked among
     the downloads - the earlier download is the default."""
@@ -635,9 +1065,13 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         if first is None:
             fail(why, "--gguf-dir takes the folder that holds the GLM-5.3-Flash .gguf files, or the (first) .gguf file")
         return "local", first
+    hip = getattr(a, "backend", None) == "hip"
     if a.model:
+        if hip and is_exl3(a.model):
+            fail(f"{a.model} runs on NVIDIA GPUs only (the HIP port has no EXL3 kernels)",
+                 f"pick another model: {ME} --setup")
         return "download", a.model
-    opts = list(MODELS)
+    opts = [q for q in MODELS if not (hip and is_exl3(q))]   # (EXL3: NVIDIA only)
     # cards of 24 GB or less: Maya-S24 (its 4-bit attention leaves ~1.5 GB more of the card for experts - decode about
     # 14% faster there), else Maya-S
     try:
@@ -653,7 +1087,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         rows.append((f"{q}: " + (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging "
                                                                      "Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
-                     else None, m["about"]))
+                     else "experimental" if is_exl3(q) else None, m["about"]))
     pick = choose("Model?", ["The model to download (GLM-5.3-Flash GGUF files you already have: --gguf-dir <file or "
                              "folder>):"], rows, opts.index(default), a.yes)
     return "download", opts[pick]
@@ -700,10 +1134,20 @@ def cached_generator():
 
 def arch_setting(archs) -> str:
     """CMAKE_CUDA_ARCHITECTURES for these GPUs.  CMakeLists.txt refuses an explicit arch below 75 (Strata's own
-    qwen4exp floor), but the GLM path is developed and measured on Volta V100s (sm_70) - so for those the build
-    asks CMake for this machine's own GPUs ("native", which the guard leaves to CMake), with CUDA_VISIBLE_DEVICES
-    limited to the chosen cards.  RELEASE-CHECKLIST.md has the one-line CMake fix that makes this unnecessary."""
+    qwen4exp floor), but the GLM path is developed and measured on Volta V100s (sm_70) - so for those (and Pascal's
+    sm_6x, experimental) the build asks CMake for this machine's own GPUs ("native", which the guard leaves to
+    CMake), with CUDA_VISIBLE_DEVICES limited to the chosen cards.  RELEASE-CHECKLIST.md has the one-line CMake fix
+    that makes this unnecessary."""
     return ";".join(str(x) for x in archs) if min(archs) >= 75 else "native"
+
+
+def toolkit_root_defs(nvcc) -> list:
+    """CUDAToolkit_ROOT for the toolkit whose nvcc builds the engine.  Without it CMake can take cudart and cuBLAS from
+    another toolkit: with --nvcc /opt/cuda-13.0/bin/nvcc on Ubuntu 24.04 that also has the distribution's CUDA 12.0
+    (nvidia-cuda-toolkit), the engine was compiled with the 13.0 headers but linked libcudart.so.12 from
+    /usr/lib/x86_64-linux-gnu.  The distribution's own nvcc (/usr/bin) keeps CMake's search as before (Strata #1359)."""
+    root = Path(nvcc).resolve().parent.parent
+    return [] if root == Path("/usr") else [f"-DCUDAToolkit_ROOT={root}"]
 
 
 def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False) -> dict | None:
@@ -715,8 +1159,9 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
                 "2022 (its Build Tools are enough);" if WIN else
                 "common causes: 'unsupported GNU version' - install an older g++ your CUDA accepts (e.g. g++-13) and run "
                 "again (it is found by itself), or pass --host-compiler g++-13;") + (
-                "\n       'Unsupported gpu architecture compute_70' - CUDA 13 cannot build for Volta, "
-                "install CUDA 12.x;\n       the compiler killed (out of memory) - close programs and run it again "
+                "\n       'Unsupported gpu architecture compute_70' (or compute_61) - CUDA 13 cannot build for Volta "
+                "or Pascal, install CUDA 12.x;\n       the compiler killed (out of memory) - close programs and run it "
+                "again "
                 "(it continues)")
         if soft:
             warn(msg + "; starting the engine compiled before")
@@ -735,7 +1180,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
              "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
              "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
-             f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"]
+             f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}"]
     if host_compiler:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(host_compiler) or host_compiler}")
     # "native" is what CMake sees: only the chosen cards, numbered as nvidia-smi numbers them
@@ -746,7 +1191,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
         " (10-30 minutes the first time, a few minutes after an update) ...")
     if cuda_archs == "native":
-        say("  (CMakeLists.txt refuses an explicit sm_70 - Strata's own floor is sm_75 - so CMake is asked for this")
+        say("  (CMakeLists.txt refuses an explicit sm_70 - Maya's own floor is sm_75 - so CMake is asked for this")
         say(f"  machine's GPUs instead: CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
     stopped = cmake_steps(conf, build, env, "build-maya.bat")
     if stopped:
@@ -768,7 +1213,7 @@ def shell_join(cmd) -> str:
     return cmdline(cmd) if WIN else shlex.join(cmd)
 
 
-def cmake_steps(conf, build, env, bat_name: str) -> str | None:
+def cmake_steps(conf, build, env, bat_name: str, vcvars=None) -> str | None:
     """CMake's configure, then its build (once more when that stops: it continues where it stopped).  None when both
     worked, else what stopped.  On Windows both run in a .bat that first calls Visual Studio's vcvars64.bat - the
     compiler's environment - the way Strata's setup.py builds there (cmake_build)."""
@@ -780,7 +1225,7 @@ def cmake_steps(conf, build, env, bat_name: str) -> str | None:
             if run(build, env=env, check=False).returncode != 0:
                 return "compiling"
         return None
-    vcvars = S.find_vcvars()
+    vcvars = vcvars or S.find_vcvars()
     if vcvars is None:
         return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
     bat = ROOT / bat_name
@@ -855,28 +1300,57 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | No
     cmake = pick_cmake()
     if not cmake:
         fail("CMake 3.24 or newer is needed")
+    clang = hip_clang(root) or root / "llvm/bin/clang++"
+    bindir = Path(pc.get("rocm_bin") or root / "bin")
     env = dict(os.environ, HIP_PLATFORM="amd", HIP_COMPILER="clang", HIP_RUNTIME="rocclr",
                ROCM_PATH=str(root), HIP_PATH=str(root))
-    env["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm/bin"), env.get("PATH", "")])
-    env["LD_LIBRARY_PATH"] = os.pathsep.join([str(root / "lib"), env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+    env["PATH"] = os.pathsep.join([str(bindir), str(clang.parent), env.get("PATH", "")])
+    if not WIN:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join([str(root / "lib"), env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
     # Keep compiler-cache writes inside this project, including when run in a workspace sandbox.
     env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
-    conf = [cmake, "-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
-            "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
-            "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
-            f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
-            f"-DCMAKE_HIP_COMPILER={root / 'llvm/bin/clang++'}", f"-DCMAKE_PREFIX_PATH={root}",
-            f"-DSTRATA_GGML_DIR={llama}"]
+    conf = [cmake]
+    if WIN:
+        # as tools\hip\build_maya_windows.bat, which built it on Windows (#54): ROCm's clang for the host code too, in
+        # Visual Studio's environment (cmake_steps), with Ninja, the paths with forward slashes; AVX2 ggml
+        ninja = venv_tool("ninja") or shutil.which("ninja")
+        if not ninja:
+            fail("Ninja is needed to compile the HIP engine on Windows", f"run {ME} --setup again (pip puts it into .venv)")
+        bitcode = clang.parent.parent / "amdgcn" / "bitcode"
+        env["HIP_DEVICE_LIB_PATH"] = str(bitcode)
+        conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}",
+                 f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
+                 f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}",
+                 "-DSTRATA_PORTABLE=ON"]
+        if " " not in str(root) + str(bitcode):        # (with a space in them, clang takes HIP_PATH and the above)
+            conf.append(f"-DCMAKE_HIP_FLAGS=--rocm-path={root.as_posix()} --rocm-device-lib-path={bitcode.as_posix()}")
+    conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
+             "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
+             "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
+             f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
+             f"-DCMAKE_HIP_COMPILER={clang.as_posix()}", f"-DCMAKE_PREFIX_PATH={root.as_posix()}",
+             f"-DSTRATA_GGML_DIR={llama.as_posix()}"]
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
     say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
-    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)], env, ""):
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)], env,
+                   "build-maya-hip.bat", vcvars=S.find_vcvars(cuda=False) if WIN else None):
         if soft:
             warn("HIP rebuild failed; starting the previous engine")
             return None
         fail("the HIP engine build failed", "see the compiler output above")
+    if WIN:
+        # Windows takes a program's DLLs from its own folder, then System32 - where AMD's driver puts its own HIP
+        # runtime - and PATH only after: the runtime the engine was built with goes next to it (as llama.cpp's
+        # Windows builds do; with the driver's, cudaMemGetInfo failed there). lib_dirs keeps the libraries
+        for pattern in ("amdhip64*.dll", "amd_comgr*.dll", "rocm_kpack*.dll"):
+            for dll in bindir.glob(pattern):
+                try:
+                    shutil.copy2(dll, EXE.parent)
+                except OSError as e:                   # (in use: an engine still running keeps the one it has)
+                    warn(f"could not copy {dll.name} next to the engine ({e})")
     meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
             "gpu_ids": [g["index"] for g in pc["gpus"]], "llama": str(llama),
-            "lib_dirs": [str(root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M")}
+            "lib_dirs": [str(bindir if WIN else root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M")}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
     ok(f"engine compiled: {EXE}")
     return meta
@@ -913,11 +1387,13 @@ def refresh_engine(cfg: dict) -> None:
     if cfg.get("backend") == "hip":
         root = Path(meta.get("rocm") or "/opt/rocm")
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
-        if not (root / "llvm/bin/clang++").exists() or not (llama / "ggml/CMakeLists.txt").exists():
+        if hip_clang(root) is None or not (llama / "ggml/CMakeLists.txt").exists():
             warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
             return
         pc = {"rocm": str(root), "archs": meta["archs"],
               "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
+        if WIN and meta.get("lib_dirs"):
+            pc["rocm_bin"] = meta["lib_dirs"][0]
         compile_engine_hip(pc, llama, src, soft=True)
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
@@ -1024,33 +1500,73 @@ def incomplete(path: Path):
         g = GGUFFile(path)
     except Exception as e:                             # noqa: BLE001 - a partial header raises anything
         return f"not a whole GGUF file ({e})"
-    need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
+    # a shard of metadata alone (unsloth's first: the tokenizer, no tensors) is whole at its header's end - its writer
+    # leaves out the alignment padding no data follows (#83), and the engine reads it so
+    need = (g.data_start + max(t.offset + (t.expected_bytes() or 0) for t in g.tensors) if g.tensors
+            else g.header_end)
     have = path.stat().st_size
     return None if have >= need else f"short: {have:,} of {need:,} bytes"
 
 
+def file_incomplete(m: dict, path: Path):
+    """Why a download's file is not whole, or None when it is: a GGUF by its own tensor directory (incomplete), an
+    EXL3 model's file by its published size."""
+    if "files" not in m:
+        return incomplete(path)
+    if not path.exists():
+        return "missing"
+    have, want = path.stat().st_size, m["files"][hf_name(m, path)]
+    return None if have == want else f"{have:,} of {want:,} bytes"
+
+
 def quant_of(first: Path) -> str:
     for q, mm in MODELS.items():                       # a Maya download, under its name on Hugging Face or its old one
+        if "files" in mm:                              # (an EXL3 download is no .gguf file)
+            continue
         if first.name in [names[0] for names in [shard_names(mm)] + old_names(mm)]:
             return q
     m = re.match(r"GLM-5\.3-Flash-(.+?)(-\d{5}-of-\d{5})?\.gguf$", first.name, re.I)
     return m.group(1) if m else first.parent.name
 
 
-def sha256_ok(path: Path, want: str) -> bool:
+def sha256_ok(path: Path, want) -> bool:
+    """`want`: the published sha256, or a list of them - a file published again with only its header changed (v1.0.28:
+    the architecture spelled as llama.cpp spells it) keeps the earlier download valid."""
     import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for b in iter(lambda: f.read(64 << 20), b""):
             h.update(b)
-    return h.hexdigest() == want.lower()
+    return h.hexdigest() in [w.lower() for w in ([want] if isinstance(want, str) else want)]
+
+
+VERIFIED = ".maya-verified.json"                   # in a model folder: the files whose sha256 matched, by size and time
+
+
+def sha256_checked(path: Path, want) -> bool:
+    """sha256_ok, read once: a file that matched is remembered (VERIFIED) with its size and modification time, and not
+    read again until either changes."""
+    book = read_json(path.parent / VERIFIED)
+    st = path.stat()
+    seen = book.get(path.name) or {}
+    if seen.get("size") == st.st_size and seen.get("mtime_ns") == st.st_mtime_ns:
+        return True
+    say(f"  checking {path.name}'s sha256 ...")
+    if not sha256_ok(path, want):
+        return False
+    book[path.name] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    try:
+        (path.parent / VERIFIED).write_text(json.dumps(book, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    return True
 
 
 def offer_download(a, quant: str, d: Path, shards: list) -> bool:
     """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
     (or --download-model).  False: nothing was downloaded."""
     m = MODELS[quant]
-    missing = [s for s in shards if incomplete(s)]
+    missing = [s for s in shards if file_incomplete(m, s)]
     urls = {s: hf_url(m["repo"], m["revision"], m["folder"], hf_name(m, s)) for s in shards}
     on_disk = sum(s.stat().st_size for s in shards if s.exists()) / 1e9
     remaining = max(0.0, m["download_gb"] - on_disk)
@@ -1060,7 +1576,7 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
         [["curl", "-L", "--fail", "--retry", "5", "-C", "-", "-o", str(s), urls[s]] for s in missing]
     say(f"  {quant}: {m['about']}.")
     say(f"  Source: https://huggingface.co/{m['repo']}" + (f" (folder {m['folder']}/)" if m["folder"] else "") +
-        "; the files' own license applies.")
+        (f" (branch {m['branch']})" if m.get("branch") else "") + "; the files' own license applies.")
     say(f"  The model is {m['download_gb']:.1f} GB in {len(shards)} file{'s' if len(shards) != 1 else ''}; "
         f"{len(missing)} still to download, about "
         f"{remaining:.0f} GB, into")
@@ -1075,8 +1591,12 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
     say("  The exact commands (resumable: running them again continues an interrupted download):")
     for c in cmds:
         say("    " + shell_join(c))
-    say("  You can also run them yourself (or download the files any other way into that folder, or pass")
-    say(f"  --gguf-dir <folder with the files>), then run {ME} again.")
+    if "files" in m:                                   # (--gguf-dir takes GGUF files only)
+        say(f"  You can also run them yourself (or download the files any other way into that folder), then run {ME}")
+        say("  again.")
+    else:
+        say("  You can also run them yourself (or download the files any other way into that folder, or pass")
+        say(f"  --gguf-dir <folder with the files>), then run {ME} again.")
     if not curl:
         warn("curl is not installed" + ("" if WIN else " (sudo apt-get install -y curl)") + ": if you say yes, the "
              "same URLs are downloaded with Python instead (also resumable)")
@@ -1095,21 +1615,19 @@ def offer_download(a, quant: str, d: Path, shards: list) -> bool:
                      f"run {ME} --download-model again: it continues where it stopped")
         else:
             S.download(urls[s], s)
-        why = incomplete(s)
+        why = file_incomplete(m, s)
         if why:
             fail(f"{s.name} after the download: {why}", f"delete it and run {ME} --download-model again")
         want = m["sha256"].get(hf_name(m, s))
-        if want:
-            say(f"  checking {s.name}'s sha256 ...")
-            if not sha256_ok(s, want):
-                fail(f"{s.name}: the sha256 does not match the published one", "delete it and download it again")
+        if want and not sha256_checked(s, want):
+            fail(f"{s.name}: the sha256 does not match the published one", "delete it and download it again")
         ok(f"{s.name} downloaded")
     return True
 
 
 def model_step(a, models: Path, choice: tuple):
     """(model folder, shards, quant name), or None when the files are not there and were not downloaded."""
-    step(5, "the model (GLM-5.3-Flash, GGUF)")
+    step(5, "the model (GLM-5.3-Flash)")
     kind, what = choice
     if kind == "local":
         shards, quant, d = shard_set(what), quant_of(what), what.parent
@@ -1124,18 +1642,42 @@ def model_step(a, models: Path, choice: tuple):
         m = MODELS[quant]
         d = download_dir(models, quant)
         shards = local_shards(m, d)
-        if any(incomplete(s) for s in shards) and not offer_download(a, quant, d, shards):
+        if any(file_incomplete(m, s) for s in shards) and not offer_download(a, quant, d, shards):
             return None
-    from gguf_reader import GGUFFile
-    arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
-    if arch not in GLM_ARCHS:
-        fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
+    if is_exl3(quant) and kind != "local":
+        conf = read_json(d / "config.json")
+        method = (conf.get("quantization_config") or {}).get("quant_method")
+        if conf.get("model_type") != "glm5_next" or method != "exl3":
+            fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not GLM-5.3-Flash "
+                 "in EXL3 (glm5_next, exl3)")
+    else:
+        from gguf_reader import GGUFFile
+        arch = str(GGUFFile(shards[0]).metadata.get("general.architecture", ""))
+        if arch not in GLM_ARCHS:
+            fail(f"{shards[0].name} is a {arch!r} model, not GLM-5.3-Flash (glm5-next)")
     gb = sum(s.stat().st_size for s in shards) / 1e9
     ok(f"{quant}: {len(shards)} file(s), {gb:.1f} GB in {d}")
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: expect slow answers (the engine reads experts from it) - an NVMe SSD "
              "is strongly recommended")
     return d, shards, quant
+
+
+def drafter_step(models: Path) -> Path:
+    """The DFlash2 drafter's file in the models folder (GLM-5.3-Flash-DFlash2/): downloaded and its sha256 checked
+    unless it is there already."""
+    dst = models / "GLM-5.3-Flash-DFlash2" / DFLASH["file"]
+    size = dst.stat().st_size if dst.exists() else 0
+    if size == DFLASH["bytes"] and sha256_ok(dst, DFLASH["sha256"]):
+        ok(f"the DFlash2 drafter: {dst}")
+        return dst
+    if size >= DFLASH["bytes"]:                    # complete but not this file: a fresh download, not a resumed one
+        dst.unlink()
+    say(f"  the DFlash2 drafter: {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face ({DFLASH['repo']}; license "
+        f"{DFLASH['license']}: non-commercial use only)")
+    fetch(hf_url(DFLASH["repo"], DFLASH["revision"], "", DFLASH["file"]), dst, DFLASH["sha256"])
+    ok(f"the DFlash2 drafter: {dst}")
+    return dst
 
 
 # ------------------------------------------------------------------------------------------------ 6. the pack
@@ -1149,16 +1691,64 @@ def pack_source(pack: Path):
     return m.group(1) if m else None
 
 
-def pack_step(a, d: Path, shards: list, llama: Path) -> Path:
+PACK_SOURCES = "sources.json"                      # in a pack: its model files' sizes and times when it was built
+
+
+def pack_stale(pack: Path, shards: list):
+    """Why a pack no longer matches its model files, or None.  The pack holds where every tensor sits in them: a file
+    that changed after the pack was built leaves those places wrong (#155: a pack built while a download manager was
+    still filling files it had created at full size indexed regions with no data yet, and the engine answered garbage,
+    fast).  A pack from before the record (PACK_SOURCES): a model file written after the pack's index counts."""
+    rec = read_json(pack / PACK_SOURCES).get("files")
+    if rec:
+        old = {r.get("name"): r for r in rec}
+        for s in shards:
+            r, st = old.get(s.name) or {}, s.stat()
+            if r.get("size") != st.st_size or r.get("mtime_ns") != st.st_mtime_ns:
+                return f"{s.name} changed after the pack was built"
+        return None
+    try:
+        built = (pack / "native_experts.txt").stat().st_mtime
+    except OSError:
+        return None
+    late = [s.name for s in shards if s.stat().st_mtime > built + 60]
+    return f"{late[0]} was written after the pack was built" if late else None
+
+
+def stamp_pack(pack: Path, shards: list) -> None:
+    """The model files' sizes and times into the pack (PACK_SOURCES), for pack_stale."""
+    files = [{"name": s.name, "size": s.stat().st_size, "mtime_ns": s.stat().st_mtime_ns} for s in shards]
+    try:
+        (pack / PACK_SOURCES).write_text(json.dumps({"files": files}, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -> Path:
     step(6, "the pack (the engine's index of the model files)")
+    if quant is not None and is_exl3(quant):
+        return exl3_pack_step(a, d)
     # the engine finds the GGUF files at <pack>/.. (src/core/glm_model.cu, load_pack): the pack lives in their folder,
     # in pack/ - or pack-<model>/ when pack/ indexes another model of the same folder
     pack = d / "pack"
     if pack_source(pack) not in (None, shards[0].name):
         pack = d / f"pack-{quant_of(shards[0])}".lower()
     if not a.repack and pack_source(pack) == shards[0].name and all((pack / f).exists() for f in PACK_FILES):
-        ok(f"pack already built: {pack}")
-        return pack
+        why = pack_stale(pack, shards)
+        if why is None:
+            if not (pack / PACK_SOURCES).exists():
+                stamp_pack(pack, shards)
+            ok(f"pack already built: {pack}")
+            return pack
+        warn(f"the pack is built again: {why}")
+    # the files a pack is built from: a Maya download's against its published sha256 (once a file - a download is
+    # checked as it lands), so a file still being written or damaged stops here, not as garbage answers (#155)
+    m = MODELS.get(quant or "") or {}
+    for s in shards:
+        want = (m.get("sha256") or {}).get(hf_name(m, s)) if m else None
+        if want and not sha256_checked(s, want):
+            fail(f"{s.name}: the sha256 does not match the published one - still being downloaded, or damaged",
+                 f"let the download finish, or delete the file and run {ME} --download-model")
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the pack is written next to the GGUF files (the engine finds them at <pack>/..)",
              "link the .gguf files into a writable folder (" + ("mklink /H DIR\\<file> <file>, for each file" if WIN
@@ -1173,6 +1763,32 @@ def pack_step(a, d: Path, shards: list, llama: Path) -> Path:
     run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
          "--compat-bf16"], env=env)
     missing = [f for f in PACK_FILES if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    stamp_pack(pack, shards)
+    ok(f"pack: {pack}")
+    return pack
+
+
+EXL3_GGUF = "maya-exl3.gguf"                       # what tools/exl3_pack.py writes beside an EXL3 model's files
+
+
+def exl3_pack_step(a, d: Path) -> Path:
+    """An EXL3 model's pack (tools/exl3_pack.py): the engine reads the EXL3 weights in place from the safetensors; the
+    pack names them, and a small GGUF beside them holds the unquantized tensors and the tokenizer."""
+    pack = d / "pack"
+    if not a.repack and pack_source(pack) == EXL3_GGUF and (d / EXL3_GGUF).exists() and \
+            all((pack / f).exists() for f in PACK_FILES + ("exl3.txt",)):
+        ok(f"pack already built: {pack}")
+        return pack
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the pack and {EXL3_GGUF} are written next to the model's files")
+    say(f"  Writing {EXL3_GGUF} (the unquantized tensors and the tokenizer, about 2 GB), the index of every tensor,")
+    say("  the small float weights (about 1 GB) and the tokenizer; the EXL3 weights stay in the safetensors (a few")
+    say("  minutes) ...")
+    run([sys.executable, str(ROOT / "tools" / "exl3_pack.py"), "--model", str(d), "--out", str(pack)])
+    missing = [f for f in PACK_FILES + ("exl3.txt",) if not (pack / f).exists()] + \
+        ([] if (d / EXL3_GGUF).exists() else [f"../{EXL3_GGUF}"])
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
     ok(f"pack: {pack}")
@@ -1212,7 +1828,8 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
              f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
              "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
-             f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}"]
+             f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
+             *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
     if meta.get("host_compiler"):
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
@@ -1300,16 +1917,21 @@ def write_run_script(cfg_path: Path, port: int) -> Path:
 
 
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
-                 choice: tuple | None = None) -> Path:
+                 choice: tuple | None = None, dflash: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
+    # --expert-cache auto: the expert pool takes the VRAM left free less the reserve (--vram-reserve-mib, 700 MiB) and
+    # is checked again once written; a number set by hand caps it at that many experts (a setup again keeps it)
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
     # can lend, up to 8192; a number (`32768`) sets the chunk itself
-    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--prefill", "auto"],
+    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--expert-cache", "auto",
+                                     "--prefill", "auto", "--kv-streaming", KV_STREAMING],
            "cwd": str(ROOT),
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
            "port": port}
+    if dflash is not None:                         # DFlash2 drafts instead of the MTP block (the engine loads no MTP)
+        cfg["args"] += ["--dflash", str(dflash)]
     env = parse_env(a.env)
     if pc.get("backend") == "hip":
         cfg["backend"] = "hip"
@@ -1321,20 +1943,23 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards: the engine picks the split (and drafts with MTP)
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
         # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
-        if any(hip_unified_memory(g) for g in gpus):   # an APU is always the only GPU (check_hip_pc)
+        if any(hip_unified_memory(g) for g in gpus):
+            if len(gpus) > 1:
+                # Pin the first part's RAM tier before the APU measures the shared memory left.
+                hip_env["STRATA_GLM_PARALLEL_LOAD"] = "0"
             total_ram, _ = mem_gb()
-            hip_env.update({"STRATA_GLM_RESERVE_MB": "1024", "STRATA_GLM_PREFILL_SUB": "1024",
+            if WIN:     # Windows counts the GPU's carve-out apart from its RAM, and its desktop runs on that GPU
+                total_ram += sum(g.get("vram_gb", 0) for g in gpus)
+            hip_env.update({"STRATA_GLM_RESERVE_MB": "3072" if WIN else "1024", "STRATA_GLM_PREFILL_SUB": "1024",
                             "STRATA_GLM_PREFILL_MB": "6144" if total_ram >= 96 else "4096"})
         elif min(g.get("vram_gb", 0) for g in gpus) >= 20:
             hip_env.update({"STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
-        # The prompt projections' hipBLASLt solutions measured per architecture (tools/hip), one table per card's
-        # architecture (':'-separated: each card takes its own). The engine refuses a table made for another
-        # hipBLASLt version and keeps plain hipBLAS.
+        # Pass every available version per architecture: the engine's existing header guard selects the
+        # table matching each card and its installed hipBLASLt, or keeps plain hipBLAS when none matches.
         tables = []
         for arch in dict.fromkeys(g.get("arch", "") for g in gpus):
             found = sorted((ROOT / "tools" / "hip").glob(f"{arch}-glm-hipblaslt-*.txt"))
-            if found:
-                tables.append(str(found[-1]))
+            tables.extend(str(path) for path in found)
         if tables:
             hip_env["STRATA_HIPBLASLT_TUNING"] = ":".join(tables)
         env = {**hip_env, **env}
@@ -1350,15 +1975,28 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
+    if PROFILE.exists():
+        cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
-        kept = keep_args(read_json(cfg_path).get("args") or [], cfg["args"], ("--prefill",))
+        old = read_json(cfg_path).get("args") or []
+        kept = keep_args(old, cfg["args"],
+                         ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
+                          "--parallel", "--expert-profile-save", "--expert-profile-save-every", "--kv-streaming",
+                          "--kv-resident"))
+        kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
+    if getattr(a, "parallel", None):
+        set_arg(cfg["args"], "--parallel", a.parallel)
+    if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
+        set_arg(cfg["args"], "--vram-reserve-mib", a.vram_reserve_mib)
+        ok(f"VRAM kept free beside the expert pool: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
         ok(line)
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
     cfg["installer"] = {"models_dir": str(models), "quant": quant, "gguf": str(local) if local else None,
-                        "gguf_dir": str(gguf_dir) if gguf_dir else None, "written": time.strftime("%Y-%m-%d %H:%M")}
+                        "gguf_dir": str(gguf_dir) if gguf_dir else None, "draft": "dflash2" if dflash else "mtp",
+                        "written": time.strftime("%Y-%m-%d %H:%M")}
     cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this model (and context) before
     if cal is not None:
         tuned = CAL.apply(cfg.get("env") or {}, cal.get("settings") or {})
@@ -1388,11 +2026,19 @@ def prefill_tips(args: list, ram: float, gpus: int = 2) -> list:
     if prefill is not None and prefill.isdigit() and int(prefill) > 8192 and ram < PREFILL_RISK_RAM_GB:
         return [f"warning: --prefill {prefill} on {ram:.0f} GB of RAM: on a split, 32768-token chunks read prompts "
                 "slower than --prefill auto with little RAM (two V100s, 30 GB: 551 against 709 tok/s); they paid off "
-                "(+21-35%) with 96 GB in Strata's community benchmarks"]
+                "(+21-35%) with 96 GB in community benchmarks"]
     if prefill == "auto" and ram >= PREFILL_BIG_RAM_GB:
         return [f"tip: with {ram:.0f} GB of RAM, --prefill 32768 in the config's args read prompts 21-35% faster in "
-                "Strata's community benchmarks; not set, nothing changes"]
+                "community benchmarks; not set, nothing changes"]
     return []
+
+
+def set_arg(args: list, flag: str, value) -> None:
+    """`flag value` in the engine arguments: its value replaced, or the pair added (`args` is changed in place)."""
+    if flag in args[:-1]:
+        args[args.index(flag) + 1] = str(value)
+    else:
+        args += [flag, str(value)]
 
 
 def keep_args(old: list, new: list, flags: tuple) -> list:
@@ -1413,6 +2059,35 @@ def keep_args(old: list, new: list, flags: tuple) -> list:
     return kept
 
 
+def flag_value(args: list, flag: str):
+    """The value after `flag` in an argument list, or None."""
+    return args[args.index(flag) + 1] if flag in args[:-1] else None
+
+
+def add_profile(cfg: dict) -> bool:
+    """A GLM config with no --expert-profile (written before setup passed one) gets the shipped profile, as a setup
+    would write it: an update restarts the installed config without setting up again.  True when `cfg` changed."""
+    args = cfg.get("args")
+    if not isinstance(args, list) or "--glm-pack" not in args[:-1] or "--expert-profile" in args or not PROFILE.exists():
+        return False
+    args += ["--expert-profile", str(PROFILE)]
+    return True
+
+
+def keep_profile(old: list, new: list) -> list:
+    """A learned expert profile wired in by hand: the old config's --expert-profile replaces the
+    shipped one only when it is another file that still exists (a moved or deleted one falls back to the shipped
+    profile).  `new` is changed in place; what was kept is returned."""
+    mine, shipped = flag_value(old, "--expert-profile"), flag_value(new, "--expert-profile")
+    if not mine or mine == shipped or Path(mine).name == PROFILE.name or not Path(mine).exists():
+        return []                                         # (the shipped one, or another copy's own)
+    if shipped is not None:
+        new[new.index("--expert-profile") + 1] = mine
+    else:
+        new += ["--expert-profile", mine]
+    return ["--expert-profile " + mine]
+
+
 # ------------------------------------------------------------------------------------------------ calibration
 CAL_STORE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "project-maya" / "calibration.json"
 
@@ -1427,7 +2102,7 @@ def hardware_key(cfg: dict) -> str:
     quant = (cfg.get("installer") or {}).get("quant") or cfg.get("model_name", "?")
     return "|".join([" + ".join(g.get("name", "?") for g in sel) or "?",
                      f"{sum(g.get('vram_gb', 0) for g in sel):.0f}GB", S.cpu_info()[0], f"{S.ram_gb():.0f}GB", quant,
-                     str(ctx), "images" if cfg.get("vision") else "text"])
+                     str(ctx), "images" if cfg.get("vision") else "text"] + (["dflash2"] if "--dflash" in a else []))
 
 
 def load_calibrations() -> dict:
@@ -1527,10 +2202,114 @@ def calibrate_config(cfg_path: Path) -> bool:
     return True
 
 
+def drafter_file(cfg: dict) -> Path | None:
+    """The DFlash2 drafter this config drafts with (--dflash), else the one a setup downloaded into its models folder
+    when it is there; None: no drafter on this PC."""
+    args = cfg.get("args") or []
+    if "--dflash" in args[:-1]:
+        return Path(args[args.index("--dflash") + 1])
+    models = (cfg.get("installer") or {}).get("models_dir")
+    f = Path(models) / "GLM-5.3-Flash-DFlash2" / DFLASH["file"] if models else None
+    return f if f is not None and f.is_file() else None
+
+
+def parallel_of(cfg: dict) -> int:
+    args = cfg.get("args") or []
+    v = args[args.index("--parallel") + 1] if "--parallel" in args[:-1] else "1"
+    return int(v) if str(v).isdigit() else 1
+
+
+def needs_speed_calibration(cfg: dict) -> bool:
+    """A config that drafts with DFlash2 but has no speed calibration yet (set up before there was one, or its
+    calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
+    the engine then decodes without the drafter."""
+    args = cfg.get("args") or []
+    return "--dflash" in args[:-1] and parallel_of(cfg) <= 1 and \
+        "speed_calibration" not in (cfg.get("installer") or {})
+
+
+def speed_calibration(cfg_path: Path, why: str = "") -> bool:
+    """The speed calibration (tools/calibrate_draft.py): this config's sustained decode speed with the DFlash2 drafter
+    and without it (the MTP block; one GPU: no drafting), measured on this PC.  The config keeps the faster - DFlash2
+    only when it wins by more than CD.MIN_GAIN - and the result (installer.speed_calibration), so it runs once: a setup
+    that chooses DFlash2, or --speed-calibration, measures again.  False: not measured (the reason is shown; nothing
+    changed, and a failure is recorded so that a start does not try again by itself)."""
+    cfg = read_json(cfg_path)
+    drafter = drafter_file(cfg)
+    if drafter is None or not drafter.is_file():
+        warn("the speed calibration compares the DFlash2 drafter with the MTP block, and the drafter is not on this "
+             f"PC: {ME} --setup --draft dflash2 downloads it")
+        return False
+    if parallel_of(cfg) > 1:
+        warn("with --parallel above 1 the engine decodes without the DFlash2 drafter: no speed calibration")
+        return False
+    one = len(cfg.get("gpu") or [0]) < 2
+    other = "no drafting" if one else "the MTP block"
+    busy = busy_gpus(cfg)
+    if busy:
+        warn("the speed calibration needs the GPU(s) to itself: " +
+             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
+             f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration")
+        return False
+    without = CD.without_dflash(cfg)
+    cal = saved_calibration(without)                   # the CPU lane tuned on this PC without DFlash2: that side as so
+    if cal is not None and cal.get("settings") is not None:
+        env = CAL.apply(without.get("env") or {}, cal["settings"])
+        if env:
+            without["env"] = env
+        else:
+            without.pop("env", None)
+    with_d = CD.with_dflash(cfg, drafter)
+    say()
+    say("  Speed calibration: DFlash2 or " + other + "?" + (f" ({why})" if why else ""))
+    say("  DFlash2 makes some PCs faster and others slower: it depends on how much of the model fits in the GPUs'")
+    say("  memory, and on the CPU and the RAM. So Maya measures both here, the way you will use it. It loads the")
+    say(f"  model twice ({other}, then DFlash2); each time it reads a long document, writes about {CD.MIN_TOKENS} "
+        "tokens")
+    say("  of answers after a warm-up, and the sustained speeds are compared. About 5-20 minutes; the PC is busy.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    try:
+        res = CD.run(without, with_d, say=say, other_label=other)
+    except Exception as e:                             # never stops a setup or a start: the config stays as it was
+        now = "DFlash2" if "--dflash" in (cfg.get("args") or [])[:-1] else other
+        warn(f"the speed calibration did not finish ({e}): nothing changed - Maya keeps {now}; "
+             f"{ME} --speed-calibration tries again")
+        why_not = CAL.engine_error(log, since)
+        if why_not:
+            say(f"       the engine said: {why_not}")
+        cfg.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        return False
+    o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
+    keep = res["keep"] == "dflash2"
+    out = with_d if keep else without
+    inst = out.setdefault("installer", {})
+    inst["draft"] = "dflash2" if keep else "mtp"
+    inst["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(),
+                                 "dflash2_tok_s": d, ("no_drafting" if one else "mtp") + "_tok_s": o,
+                                 "tokens": [res["other"]["tokens"], res["dflash2"]["tokens"]], "kept": inst["draft"]}
+    cfg_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    say()
+    if keep:
+        ok(f"speed calibration: DFlash2 is faster on this PC - {d:.1f} against {o:.1f} tokens/s with {other} "
+           f"(+{res['gain'] * 100:.0f}%): Maya drafts with DFlash2")
+    else:
+        ok(f"speed calibration: DFlash2 is not faster on this PC - {d:.1f} against {o:.1f} tokens/s with {other}: "
+           "Maya " + ("decodes without drafting" if one else "drafts with the MTP block"))
+        say(f"       (saved in {cfg_path.name}; to draft with DFlash2 anyway: {ME} --setup --draft dflash2 "
+            "--no-speed-calibration)")
+    return True
+
+
 def server_command(cfg_path: Path, a) -> tuple:
     """The dashboard's server for an installed config: (its command, its environment, what the setup's screen shows of
     it).  The engine is compiled again first when its source changed (an update)."""
     cfg = read_json(cfg_path)
+    if getattr(a, "parallel", None):                   # --parallel given at a start: kept in the config
+        set_arg(cfg.setdefault("args", []), "--parallel", a.parallel)
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
     pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
@@ -1538,8 +2317,24 @@ def server_command(cfg_path: Path, a) -> tuple:
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
+    # a model file changed after its pack was built (pack_stale, #155): the pack's places in it are wrong
+    src = pack_source(pack)
+    if src is not None and src != EXL3_GGUF and all(s.exists() for s in shard_set(pack.parent / src)):
+        why = pack_stale(pack, shard_set(pack.parent / src))
+        if why is not None:
+            fail(f"{cfg_path.name}: {why}, so its index of where the tensors sit is wrong",
+                 f"run {ME} --setup --repack to build it again (a few minutes)")
+        if not (pack / PACK_SOURCES).exists():
+            stamp_pack(pack, shard_set(pack.parent / src))
+    if add_profile(cfg):                               # a config written before the expert profile (an update)
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        ok(f"{cfg_path.name}: starts from the shipped expert profile now (--expert-profile {PROFILE})")
     cfg_path.touch()                                   # the most recently used model
     refresh_engine(cfg)
+    if needs_speed_calibration(cfg):                   # DFlash2 set up before the speed calibration: measured once
+        if speed_calibration(cfg_path, "once, for a setup that drafts with DFlash2 - new in this version"):
+            cfg = read_json(cfg_path)
+            args = cfg.get("args") or []
     port = a.port or cfg.get("port") or 8080
     host = a.host or cfg.get("host") or "127.0.0.1"
     key = a.api_key or cfg.get("api_key")
@@ -1662,13 +2457,21 @@ def speed_lines(text) -> list:
     return picked
 
 
-def hip_gpu_report(rocm: Path) -> str:
+def hip_gpu_report(rocm: Path, bindir=None) -> str:
     """Static AMD details, with KFD's HIP indices/architectures even when no SMI tool is installed.
 
     Keep the SMI JSON in its own device order: its DRM indices need not match KFD's HIP indices.
     This also retains driver/VRAM fields across the different versions of the two tools.
+    On Windows: ROCm's hipInfo (HIP's indices), else Windows' display adapters.
     """
     import platform
+    if WIN:
+        exe = hip_info(bindir or rocm / "bin")
+        gpus = S.amd_gpus(exe)
+        lines = [("hipInfo" if exe else "Windows' display adapters (no hipInfo)") + " (HIP GPU indices):"]
+        lines += [f"{gpu_label(g)}; driver {g.get('driver', '?')}" for g in gpus] or ["no AMD GPUs found"]
+        lines.append(f"Windows {platform.version()}")
+        return "\n".join(lines)
     gpus = S.amd_gpus()
     lines = ["KFD topology (HIP GPU indices):"]
     lines += [f"{gpu_label(g)}; driver {g.get('driver', 'amdgpu')}" for g in gpus]
@@ -1709,8 +2512,8 @@ def rocm_report(rocm: Path) -> str:
         if version:
             break
     if not version:
-        hipcc = rocm / "bin/hipcc"
-        if hipcc.is_file():
+        hipcc = next((p for p in (rocm / "bin/hipcc", rocm / "bin/hipcc.exe") if p.is_file()), None)
+        if hipcc is not None:
             version = S.out([str(hipcc), "--version"]).strip()
     return f"path {rocm}\nversion {version or 'unknown (ROCm version file / hipcc unavailable)'}"
 
@@ -1744,7 +2547,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
     if backend == "hip":
         rocm = Path((cfg.get("env") or {}).get("ROCM_PATH") or os.environ.get("ROCM_PATH")
                     or stamp.get("rocm") or "/opt/rocm").expanduser().resolve()
-        add("GPUs", hip_gpu_report(rocm))
+        add("GPUs", hip_gpu_report(rocm, (stamp.get("lib_dirs") or [None])[0] if WIN else None))
         add("ROCm", rocm_report(rocm))
     else:
         add("GPUs", S.out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
@@ -1968,15 +2771,29 @@ def set_up(a, prev: dict) -> Path | None:
         ok(f"model: {choice[1]}, in {download_dir(models, choice[1])}")
     else:
         ok(f"model: {choice[1]} (yours)")
+    draft = choose_draft(a, pc, inst)
+    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
     got = model_step(a, models, choice)                # 5
     if got is None:
         return None
     d, shards, quant = got
-    pack = pack_step(a, d, shards, llama)              # 6
+    dflash = drafter_step(models) if draft == "dflash2" else None
+    pack = pack_step(a, d, shards, llama, quant)       # 6
     vision = vision_step(a, pc, meta, llama, d, quant)  # 7
-    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice)   # 8
+    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash)   # 8
+    if dflash is not None:                             # DFlash2: kept only if it makes THIS PC faster (measured)
+        if getattr(a, "no_speed_calibration", False):
+            c = read_json(cfg_path)
+            c.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                  "skipped": "--no-speed-calibration"}
+            cfg_path.write_text(json.dumps(c, indent=1), encoding="utf-8")
+            ok("speed calibration skipped (--no-speed-calibration): Maya drafts with DFlash2")
+        else:
+            if S.UI is not None:                       # (the screen shows it in the tuning's tab)
+                S.UI.step(9, "speed calibration: DFlash2 or the MTP block")
+            speed_calibration(cfg_path)
     # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone
     # answers (--yes and --no-start setups are not held up by it)
     tuned = None
@@ -2012,7 +2829,7 @@ def maya_version() -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--backend", choices=["cuda", "hip"], help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux)")
+    ap.add_argument("--backend", choices=["cuda", "hip"], help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
@@ -2024,6 +2841,9 @@ def main() -> int:
                     help="download the model without asking (the commands and the size are still printed)")
     ap.add_argument("--model", choices=list(MODELS), help=f"which download (default: asked, {next(iter(MODELS))} "
                                                           "recommended)")
+    ap.add_argument("--draft", choices=list(DRAFTS),
+                    help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
+                         f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")
     ap.add_argument("--no-vision", action="store_true", help="text only: no image encoder (saves its build and "
                                                              "its 1.1 GB of files)")
     ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash GGUF files you already have: the folder with all of them, "
@@ -2033,16 +2853,23 @@ def main() -> int:
     ap.add_argument("--models-dir", help="where downloaded models go, each in a folder named after it, e.g. "
                                          "<DIR>/Maya-L/ (default: Maya-data/models next to this folder); use "
                                          "a fast NVMe SSD with ~100 GB free")
-    ap.add_argument("--gpu", type=int, help="run on this one GPU (CUDA: nvidia-smi; HIP: KFD topology order)")
+    ap.add_argument("--gpu", type=int, help="run on this one GPU (CUDA: nvidia-smi; HIP: KFD topology order, on Windows hipInfo's)")
     ap.add_argument("--gpus", help=f"split the model's layers across these GPUs (up to {MAX_GPUS}), e.g. 0,1 or "
                                    "0,1,2,3")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
+    ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
+                    help="answer up to N requests at once (1-8, default 1), kept in the config: on one GPU they are "
+                         "decoded together, more tokens per second in all; each extra conversation keeps its own "
+                         "context in VRAM, which the expert cache gives up")
+    ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
+                    help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
+                         "programs (default 700), kept in the config")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
                                    "other devices on your network (set --api-key too)")
     ap.add_argument("--api-key", help="require this key from API clients and the dashboard")
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
-                    help="an engine setting kept in the config, e.g. STRATA_GLM_RAM_HEADROOM_GB=4 (README-MAYA.md)")
+                    help="an engine setting kept in the config, e.g. STRATA_GLM_RAM_HEADROOM_GB=4 (docs/SETTINGS.md)")
     ap.add_argument("--nvcc", help="the CUDA toolkit's nvcc to build with (default: the newest that fits your GPUs)")
     ap.add_argument("--host-compiler", help="the C++ compiler nvcc uses, e.g. g++-12 (when the default g++ is newer "
                                             "than your CUDA accepts)")
@@ -2058,9 +2885,17 @@ def main() -> int:
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes), "
                          "then start the model (with --no-start: only tune)")
+    ap.add_argument("--speed-calibration", action="store_true",
+                    help="measure on this PC whether the DFlash2 drafter decodes faster than the MTP block (sustained "
+                         "speed, ~5-20 minutes, the model loaded twice) and keep the faster; then start the model "
+                         "(with --no-start: only measure)")
+    ap.add_argument("--no-speed-calibration", action="store_true",
+                    help="with --draft dflash2: keep DFlash2 without measuring it against the MTP block")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
+    if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
+        ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.config is not None:
         if not a.config.is_file():
             ap.error(f"config not found: {a.config}")
@@ -2073,8 +2908,7 @@ def main() -> int:
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "maya.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
-    say(f"Project Maya v{version} - GLM-5.3-Flash on your own GPU(s). Built on Strata (MIT) and ggml/llama.cpp "
-        "(MIT).")
+    say(f"Project Maya v{version} - GLM-5.3-Flash on your own GPU(s).")
     if a.report:
         return report(version, a.backend, a.config)
     if a.bench:
@@ -2091,7 +2925,7 @@ def main() -> int:
     else:
         a.backend = "hip" if have and read_json(have[0]).get("backend") == "hip" else "cuda"
     setting_up = a.setup or a.check or a.gguf_dir or a.model or a.rebuild or a.repack or a.download_model
-    if have and not setting_up and (a.calibrate or not a.no_start):
+    if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):
         pick = have[0]
         if len(have) > 1:
             say()
@@ -2104,6 +2938,11 @@ def main() -> int:
                 say()
                 warn("this PC is NOT tuned (the reason is above): the model " +
                      ("keeps" if a.no_start else "starts with") + " the engine's own settings")
+            if a.no_start:
+                return 0
+        if a.speed_calibration:
+            refresh_engine(read_json(pick))            # (the engine it measures is the current one)
+            speed_calibration(pick, "asked for")
             if a.no_start:
                 return 0
         return start(pick, a)

@@ -1,5 +1,6 @@
 """tools/test_maya_models.py - the setup's model downloads: what a setup is offered (Project Maya's four quants, the
-24 GB recommendation) and that every download names a hash per file.  No GPU, no network."""
+24 GB recommendation, the EXL3 model on NVIDIA only) and that every download names a hash per file.  No GPU, no
+network."""
 from pathlib import Path
 import shlex
 import sys
@@ -22,11 +23,23 @@ class ModelChoice(unittest.TestCase):
             kind, quant = maya.choose_model(args, Path(d), inst)
         return kind, quant, "\n".join(lines)
 
-    def test_new_setup_offers_the_four_maya_quants(self):
+    def test_new_setup_offers_the_maya_quants(self):
         kind, quant, text = self.choose({})
         self.assertEqual((kind, quant), ("download", "Maya-S-v2-IQ2_XXS"))
-        for q in ("Maya-S-v2-IQ2_XXS:", "Maya-S24:", "Maya-M:", "Maya-L:"):
+        for q in ("Maya-S-v2-IQ2_XXS:", "Maya-S24:", "Maya-M:", "Maya-M-Derisked:", "Maya-L:"):
             self.assertIn(q, text)
+
+    def test_maya_m_derisked_downloads_from_its_own_repo_with_mayas_vision_files(self):
+        m = maya.MODELS["Maya-M-Derisked"]
+        names = maya.shard_names(m)
+        self.assertEqual(names[0], "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00001-of-00003.gguf")
+        self.assertEqual(maya.hf_url(m["repo"], m["revision"], m["folder"], names[0]),
+                         "https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF/resolve/main/"
+                         "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00001-of-00003.gguf")
+        self.assertEqual(maya.quant_of(Path(names[0])), "Maya-M-Derisked")
+        self.assertEqual(maya.quant_of(Path(maya.shard_names(maya.MODELS["Maya-M"])[0])), "Maya-M")
+        self.assertEqual(m["vision"]["repo"], maya.MODELS["Maya-M"]["repo"])   # its repo holds no vision files
+        self.assertEqual(m["vision"]["sha256"], maya.MODELS["Maya-M"]["vision"]["sha256"])
 
     def test_24gb_cards_get_maya_s24(self):
         self.assertEqual(self.choose({}, vram_gb=24.0)[1], "Maya-S24")
@@ -42,9 +55,58 @@ class ModelChoice(unittest.TestCase):
 
     def test_every_download_names_a_hash_per_shard(self):
         for q, m in maya.MODELS.items():
-            names = {m["file"].format(i=i, n=m["shards"]) for i in range(1, m["shards"] + 1)}
-            self.assertEqual(set(m["sha256"]), names, q)
-            self.assertTrue(all(len(h) == 64 for h in m["sha256"].values()), q)
+            self.assertEqual(set(m["sha256"]), set(maya.shard_names(m)), q)
+            for h in m["sha256"].values():                   # a hash, or several (a header republished: v1.0.28)
+                self.assertTrue(all(len(x) == 64 for x in ([h] if isinstance(h, str) else h)), q)
+
+    def test_a_download_matches_any_published_hash(self):
+        import hashlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.gguf"
+            p.write_bytes(b"maya")
+            good = hashlib.sha256(b"maya").hexdigest()
+            self.assertTrue(maya.sha256_ok(p, good))
+            self.assertTrue(maya.sha256_ok(p, ["0" * 64, good.upper()]))
+            self.assertFalse(maya.sha256_ok(p, ["0" * 64]))
+
+
+class WholeShards(unittest.TestCase):
+    """incomplete(): a shard is whole as far as its own tensor directory says - and a shard of metadata alone
+    (unsloth's first: the tokenizer, no tensors) at its header's end, without the alignment padding (#83)."""
+
+    @staticmethod
+    def gguf(n_tensors: int, pad: bool) -> bytes:
+        import struct
+
+        def s(t):
+            b = t.encode()
+            return struct.pack("<Q", len(b)) + b
+        kv = s("general.architecture") + struct.pack("<I", 8) + s("glm5next")
+        kv += s("tokenizer.ggml.model") + struct.pack("<I", 8) + s("gpt2x")      # an odd length: the header unaligned
+        tinfo = b"".join(s(f"t{i}") + struct.pack("<I", 1) + struct.pack("<Q", 8) + struct.pack("<IQ", 0, 32 * i)
+                         for i in range(n_tensors))
+        head = b"GGUF" + struct.pack("<IQQ", 3, n_tensors, 2) + kv + tinfo
+        out = head + (bytes(-len(head) % 32) if pad or n_tensors else b"")
+        return out + bytes(32 * n_tensors)
+
+    def check(self, data: bytes):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "m-00001-of-00002.gguf"
+            p.write_bytes(data)
+            return maya.incomplete(p)
+
+    def test_a_metadata_shard_without_padding_is_whole(self):
+        data = self.gguf(0, pad=False)
+        self.assertNotEqual(len(data) % 32, 0)           # (the case: the header ends inside the padding)
+        self.assertIsNone(self.check(data))
+        self.assertIsNone(self.check(self.gguf(0, pad=True)))
+
+    def test_a_cut_header_or_data_is_short(self):
+        self.assertIsNotNone(self.check(self.gguf(0, pad=False)[:-3]))
+        whole = self.gguf(3, pad=True)
+        self.assertIsNone(self.check(whole))
+        self.assertTrue(self.check(whole[:-1]).startswith("short"))
 
 
 class RestartAfterUpdate(unittest.TestCase):
@@ -119,9 +181,12 @@ class LabelledNames(unittest.TestCase):
         self.assertEqual(maya.shard_names(maya.MODELS["Maya-M"])[2], "GLM-5.3-Flash-Maya-M-IQ2_S-00003-of-00003.gguf")
         self.assertEqual(maya.shard_names(maya.MODELS["Maya-S24"])[1],
                          "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00002-of-00003.gguf")
-        # one label per model: Hugging Face adds up the files that share one (Maya-S is IQ2_XXS)
-        labels = [maya.shard_names(m)[0].split("-")[-4] for m in maya.MODELS.values()]
-        self.assertEqual(len(labels), len(set(labels)), labels)
+        # one label per model in a repo: Hugging Face adds up the files that share one (Maya-S is IQ2_XXS); a model in
+        # a repo of its own may share a label (Maya-M-Derisked's IQ2_S)
+        for repo in {m["repo"] for m in maya.MODELS.values()}:
+            labels = [maya.shard_names(m)[0].split("-")[-4] for m in maya.MODELS.values()
+                      if m["repo"] == repo and "files" not in m]   # (an EXL3 model has no shards)
+            self.assertEqual(len(labels), len(set(labels)), (repo, labels))
 
     def test_a_fresh_folder_downloads_the_new_names(self):
         m = maya.MODELS["Maya-L"]
@@ -165,6 +230,192 @@ class LabelledNames(unittest.TestCase):
                 self.assertEqual(maya.quant_of(Path(names[0])), q)
         self.assertEqual(maya.quant_of(Path("GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf")),
                          "Maya-S-v2-IQ2_XXS")
+
+
+class ZfsArc(unittest.TestCase):
+    """ZFS's ARC above its floor counts as free RAM (#89): MemAvailable leaves it out, though it is given back."""
+
+    def arc(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "arcstats"
+            p.write_text(text)
+            return maya.zfs_arc_gb(str(p))
+
+    def test_the_arc_above_its_floor(self):
+        stats = ("13 1 0x01 123 33456 2734597123 2851726412342\n"
+                 "name                            type data\n"
+                 "hits                            4    123456\n"
+                 "c_min                           4    2147483648\n"
+                 "size                            4    57982058496\n")
+        self.assertAlmostEqual(self.arc(stats), 52.0, places=3)
+
+    def test_no_zfs_or_an_arc_at_its_floor(self):
+        self.assertEqual(maya.zfs_arc_gb("/nonexistent/arcstats"), 0.0)
+        self.assertEqual(self.arc("name type data\nc_min 4 4096\nsize 4 1024\n"), 0.0)
+        self.assertEqual(self.arc("name type data\nsize 4 1024\n"), 0.0)
+
+
+
+class DraftChoice(unittest.TestCase):
+    """The setup's drafting question: the MTP block by default, a DFlash2 drafter when chosen."""
+
+    def choose(self, inst, pc=None, draft=None, yes=True):
+        args = SimpleNamespace(draft=draft, yes=yes)
+        with patch.object(maya, "say"):
+            return maya.choose_draft(args, pc or {}, inst)
+
+    def test_mtp_is_the_default(self):
+        self.assertEqual(self.choose({}), "mtp")
+
+    def test_the_earlier_answer_is_the_default(self):
+        self.assertEqual(self.choose({"draft": "dflash2"}), "dflash2")
+        self.assertEqual(self.choose({"draft": "something else"}), "mtp")
+
+    def test_the_option_wins(self):
+        self.assertEqual(self.choose({"draft": "mtp"}, draft="dflash2"), "dflash2")
+
+    def test_amd_keeps_mtp_without_asking(self):
+        with patch.object(maya, "choose", side_effect=AssertionError("asked")):
+            self.assertEqual(self.choose({"draft": "dflash2"}, pc={"backend": "hip"}, yes=False), "mtp")
+
+    def test_gpus_before_sm80_keep_mtp_without_asking(self):
+        with patch.object(maya, "choose", side_effect=AssertionError("asked")):
+            self.assertEqual(self.choose({"draft": "dflash2"}, pc={"backend": "cuda", "archs": [70, 70]}, yes=False),
+                             "mtp")
+            self.assertEqual(self.choose({}, pc={"backend": "cuda", "archs": [86, 75]}, yes=False), "mtp")
+        self.assertEqual(self.choose({}, pc={"backend": "cuda", "archs": [70]}, draft="dflash2"), "dflash2")
+        self.assertEqual(self.choose({"draft": "dflash2"}, pc={"backend": "cuda", "archs": [86, 120]}), "dflash2")
+
+    def test_the_answer_typed(self):
+        with patch.object(maya, "ask", return_value="2"):
+            self.assertEqual(self.choose({}, yes=False), "dflash2")
+
+    def test_the_drafter_download_is_pinned_and_hashed(self):
+        d = maya.DFLASH
+        self.assertEqual(maya.hf_url(d["repo"], d["revision"], "", d["file"]),
+                         "https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF/resolve/"
+                         "f3569acb7f9cee95e66d24442d75536eb00ab842/GLM-5.3-Flash-DFlash2-Q4_K_M.gguf")
+        self.assertEqual(len(d["sha256"]), 64)
+
+
+class Exl3Download(unittest.TestCase):
+    """turboderp's EXL3 quant: offered with NVIDIA GPUs only, every file of its branch downloaded and checked by size
+    and hash, its config checked instead of a GGUF header, and its pack built by tools/exl3_pack.py."""
+    Q, GB, SHARDS, REV = "EXL3-3.05bpw", 125.3, 15, "332ab457b709b7ba30dd9a448be5de03b80a7ac9"
+    FILES = 27
+
+    def offered(self, backend):
+        args = SimpleNamespace(gguf_dir=None, model=None, yes=True, backend=backend)
+        lines = []
+        with tempfile.TemporaryDirectory() as d, patch.object(maya.S, "gpus", return_value=[{"vram_gb": 16.0}]), \
+                patch.object(maya, "say", side_effect=lambda *a: lines.append(" ".join(map(str, a)))):
+            quant = maya.choose_model(args, Path(d), {})[1]
+        return quant, "\n".join(lines)
+
+    def test_offered_on_nvidia_as_experimental_never_the_default(self):
+        for win in (False, True):   # Linux and Windows alike
+            with patch.object(maya, "WIN", win):
+                quant, text = self.offered("cuda")
+            self.assertIn(f"{self.Q}: download {self.GB} GB from Hugging Face   (experimental)", text)
+            self.assertNotEqual(quant, self.Q)
+
+    def test_not_offered_with_amd(self):
+        self.assertNotIn(self.Q, self.offered("hip")[1])
+        args = SimpleNamespace(gguf_dir=None, model=self.Q, yes=True, backend="hip")
+        with patch.object(maya.S, "say"), self.assertRaises(SystemExit):
+            maya.choose_model(args, Path("."), {})
+
+    def test_every_file_of_the_branch_with_size_and_hash(self):
+        m = maya.MODELS[self.Q]
+        self.assertEqual(maya.shard_names(m), list(m["files"]))
+        self.assertEqual(set(m["files"]), set(m["sha256"]))
+        self.assertIn("mtp.safetensors", m["files"])                       # the MTP draft block
+        self.assertEqual(len([n for n in m["files"] if n.startswith("model-")]), self.SHARDS)
+        self.assertAlmostEqual(sum(m["files"].values()) / 1e9, m["download_gb"], delta=0.05)
+        self.assertEqual(m["revision"], self.REV)                           # the branch's commit, pinned
+        self.assertEqual(maya.hf_url(m["repo"], m["revision"], m["folder"], "config.json"),
+                         f"https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/resolve/{self.REV}/config.json")
+        self.assertEqual(m["vision"]["repo"], "peasantsmith/GLM-5.3-Flash-Maya-GGUF")   # the same pictures files
+
+    def test_a_file_is_whole_at_its_published_size(self):
+        m = {"files": {"a.safetensors": 4}, "sha256": {}}
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "a.safetensors"
+            self.assertEqual(maya.file_incomplete(m, p), "missing")
+            p.write_bytes(b"ab")
+            self.assertEqual(maya.file_incomplete(m, p), "2 of 4 bytes")
+            p.write_bytes(b"abcd")
+            self.assertIsNone(maya.file_incomplete(m, p))
+
+    def test_the_download_names_the_branch_and_asks(self):
+        lines = []
+        args = SimpleNamespace(download_model=False)
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(maya, "say", side_effect=lambda *a: lines.append(" ".join(map(str, a)))), \
+                patch.object(maya, "rotational", return_value=False), \
+                patch.object(maya.shutil, "disk_usage", return_value=SimpleNamespace(free=500e9)), \
+                patch.object(maya, "ask", return_value="n") as ask:
+            m = maya.MODELS[self.Q]
+            shards = maya.local_shards(m, Path(d) / self.Q)
+            self.assertFalse(maya.offer_download(args, self.Q, Path(d) / self.Q, shards))
+        text = "\n".join(lines)
+        ask.assert_called_once()
+        self.assertIn(f"https://huggingface.co/turboderp/GLM-5.3-Flash-exl3 (branch {self.Q[5:]})", text)
+        self.assertIn(f"{self.FILES} still to download", text)
+        self.assertIn(f"/resolve/{self.REV}/mtp.safetensors", text)
+
+    def test_model_step_checks_the_config_not_a_gguf_header(self):
+        with tempfile.TemporaryDirectory() as d:
+            models = Path(d)
+            (models / self.Q).mkdir()
+            conf = models / self.Q / "config.json"
+            args = SimpleNamespace()
+            with patch.object(maya, "file_incomplete", return_value=None), patch.object(maya, "say"), \
+                    patch.object(maya.S, "say"), patch.object(maya, "rotational", return_value=False):
+                for n in maya.shard_names(maya.MODELS[self.Q]):
+                    (models / self.Q / n).write_bytes(b"")
+                conf.write_text('{"model_type": "glm5_next", "quantization_config": {"quant_method": "exl3"}}')
+                d_, shards, quant = maya.model_step(args, models, ("download", self.Q))
+                self.assertEqual((d_, quant, len(shards)), (models / self.Q, self.Q, self.FILES))
+                conf.write_text('{"model_type": "llama", "quantization_config": {"quant_method": "exl3"}}')
+                with self.assertRaises(SystemExit):
+                    maya.model_step(args, models, ("download", self.Q))
+
+    def test_the_pack_is_exl3_packs_and_kept_once_built(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+
+            def pack(cmd, **kw):
+                self.assertEqual([Path(cmd[1]).name] + cmd[2:], ["exl3_pack.py", "--model", str(d), "--out",
+                                                                 str(d / "pack")])
+                for f in maya.PACK_FILES + ("exl3.txt",):
+                    (d / "pack" / f).parent.mkdir(parents=True, exist_ok=True)
+                    (d / "pack" / f).write_text("x")
+                (d / "pack" / "native_experts.txt").write_text("# header (absolute offsets in maya-exl3.gguf, or in "
+                                                               "the named shard(s) beside it)\n")
+                (d / maya.EXL3_GGUF).write_bytes(b"GGUF")
+
+            args = SimpleNamespace(repack=False)
+            with patch.object(maya, "run", side_effect=pack) as run, patch.object(maya, "say"), \
+                    patch.object(maya.S, "say"):
+                self.assertEqual(maya.pack_step(args, d, [], Path("llama"), self.Q), d / "pack")
+                self.assertEqual(maya.pack_step(args, d, [], Path("llama"), self.Q), d / "pack")
+            run.assert_called_once()                                        # the second time: already built
+
+
+class Exl3Download405(Exl3Download):
+    """The same quant at 4.05 bits per weight: offered, downloaded, checked and packed as the 3.05bpw one."""
+    Q, GB, SHARDS, REV = "EXL3-4.05bpw", 165.2, 19, "2a30229e67012798ba9f0cd832bb78abf4c363d5"
+    FILES = 30                                                              # (no kpool_aux.safetensors in this branch)
+
+    def test_a_305bpw_download_is_not_taken_for_it(self):
+        # the two branches share file names (config.json, tokenizer.json, ...); their shard counts differ
+        with tempfile.TemporaryDirectory() as d:
+            models = Path(d)
+            for n in maya.shard_names(maya.MODELS["EXL3-3.05bpw"]):     # 3.05bpw straight in the models folder
+                (models / n).write_bytes(b"")
+            self.assertEqual(maya.download_dir(models, "EXL3-3.05bpw"), models)
+            self.assertEqual(maya.download_dir(models, self.Q), models / self.Q)
 
 
 if __name__ == "__main__":
