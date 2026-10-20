@@ -78,6 +78,7 @@
 #include <map>
 #include <mutex>
 #include <charconv>
+#include <climits>
 #include <cmath>
 #include <limits>
 #include <cstdio>
@@ -265,6 +266,7 @@ struct Options {
     /// the exactness test); `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
     int spec = 0;
     std::string spec_oracle;
+    std::string spec_follow, spec_follow_save;   // --glm-pack: STRATA_GLM_SPEC_FOLLOW / _SAVE (glm_pack_generate)
     int spec_corrupt = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
@@ -342,6 +344,12 @@ void usage() {
                  "                       least one draft, up to 4 while the confidences' product stays at 0.9 -\n"
                  "                       MAYA_GLM_DFLASH_MIN / _CUM).  The model's\n"
                  "                       MTP block is not loaded with it.  Env: MAYA_GLM_DFLASH\n"
+                 "  --spec-follow PATH   (--glm-pack) speed A/B: every request decodes this continuation (token ids,\n"
+                 "                       as --tokens-file takes them) instead of its own picks and ends with it; the\n"
+                 "                       drafting decodes keep exactly the drafts that match it, so two builds or\n"
+                 "                       settings process the same text.  Env: MAYA_GLM_SPEC_FOLLOW\n"
+                 "  --spec-follow-save PATH  (--glm-pack) write each request's decoded token ids there (for the above).\n"
+                 "                       Env: MAYA_GLM_SPEC_FOLLOW_SAVE\n"
                  "  --expert-cache auto|N  (--glm-pack) the expert pool in VRAM: auto (the default) takes the free\n"
                  "                       VRAM less the reserve and checks it again once written; N caps the first\n"
                  "                       GPU's at N of its largest experts.  Env: MAYA_GLM_EXPERT_CACHE\n"
@@ -970,10 +978,13 @@ double probe_pcie_h2d_gbps() {
 // summary at the end, and --serve reading `GEN <max_new> <id,id,...>` lines (QUIT ends).
 //
 // NOT wired here yet, and refused rather than approximated: prompt-prefix reuse and per-request
-// state continuity across GEN lines (each GEN starts a fresh sequence), drafts, penalty history,
+// state continuity across GEN lines (each GEN starts a fresh sequence), drafts,
 // the batched prompt path (the prompt runs one token at a time), images, control vectors and
 // layer splits.  Sampling is the engine's own sampler (strata::kernels::sample_tokens, greedy by
-// default), so the top-k/top-p/temperature chain behaves exactly as in the qwen4exp path.
+// default), so the top-k/top-p/temperature chain behaves exactly as in the qwen4exp path - the
+// penalties too (#273): the request's history (its prompt, then what it wrote) rides in
+// SamplerParams::host_history, and every pick counts its last penalty_last_n tokens
+// (Glm5Model::pick_tokens; a verify window's row t: those, then the drafts before it).
 // The stop set is GLM's own, from the GGUF metadata (the ids llama.cpp marks EOG): 154820
 // <|endoftext|> (eos), 154827 <|user|> (eot, the assistant yields the floor) and 154829 <|observation|> (a tool
 // call waits for its result); --eos-ids
@@ -1007,6 +1018,9 @@ static int glm_pack_generate(const Options& o) {
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
     // the DFlash2 drafter (--dflash, else STRATA_GLM_DFLASH): loaded with the model, on the device of its head
     if (!o.dflash.empty()) set_env("STRATA_GLM_DFLASH", o.dflash.c_str());
+    // --spec-follow / --spec-follow-save (else STRATA_GLM_SPEC_FOLLOW / _SAVE): read below, once the vocabulary is known
+    if (!o.spec_follow.empty()) set_env("STRATA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
+    if (!o.spec_follow_save.empty()) set_env("STRATA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
     // the expert profile (Strata's profile.bin: setup passes data/expert-profile-glm.bin) and the routing trace
     // (--dump-routing: tools/make_profile.py's input), before the load reads the one and the first prompt the other
     if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
@@ -1045,6 +1059,15 @@ static int glm_pack_generate(const Options& o) {
                         (unsigned long long) r.window, (unsigned long long) r.pool, (unsigned long long) r.tail,
                         (unsigned long long) r.borrow, (unsigned long long) r.vision, (long long) r.slots,
                         (long long) r.ctx, r.l0, r.l1);
+        // (Windows on an APU: the commit - the page file - kept experts off the GPU; the server's log, Monitor and
+        // /v1/status say so, as for DeepSeek's engine)
+        if (const auto cc = model.commit_capped(); cc.first > 0) {
+            std::printf("NOTE experts: %.0f GB stay off the GPU - Windows' page file is too small to hold them there; "
+                        "a page file of %zu GB keeps them on the GPU (System > About > Advanced system settings > "
+                        "Performance > Advanced > Virtual memory), then restart Maya\n", (double) cc.first / 1e9, cc.second);
+            std::printf("INFO gpu_commit_capped_gb=%.0f pagefile_hint_gb=%zu\n", std::ceil((double) cc.first / 1e9),
+                        cc.second);
+        }
     }
 
     strata::kernels::SamplerParams sp;
@@ -1056,6 +1079,46 @@ static int glm_pack_generate(const Options& o) {
 
     const std::vector<int64_t> glm_eos = {154820, 154827, 154829};
     const std::vector<int64_t>& eos = o.eos_given ? o.eos_ids : glm_eos;
+    // STRATA_GLM_KL_DUMP=<file>,<n> (a test of the K/V cache formats): --tokens-file's tokens teacher-forced - all but
+    // the last n through the prompt path, those n one at a time through the decode - and the logits after each of the
+    // n into file (n x n_vocab F32: row i predicts token size - n + i + 1)
+    if (const char* kd = std::getenv("STRATA_GLM_KL_DUMP")) {
+        const std::string spec(kd);
+        const size_t c = spec.rfind(',');
+        const std::string path = spec.substr(0, c);
+        const int64_t n = c == std::string::npos ? 64 : std::atoll(spec.c_str() + c + 1);
+        const auto& t = o.tokens;
+        if (n <= 0 || (int64_t) t.size() <= n) {
+            std::fprintf(stderr, "maya generate: STRATA_GLM_KL_DUMP needs more than %lld tokens\n", (long long) n);
+            return 2;
+        }
+        model.set_host_logits(true);
+        std::string err;
+        std::vector<float> lg;
+        const std::vector<int32_t> head(t.begin(), t.end() - n);
+        const bool pok = model.fast() && model.prefill(head, err, (int32_t) t[t.size() - (size_t) n]);
+        if (!pok && (!err.empty() || !model.forward(head, lg, err))) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        if (f == nullptr) {
+            std::fprintf(stderr, "maya generate: cannot write %s\n", path.c_str());
+            return 1;
+        }
+        for (size_t i = t.size() - (size_t) n; i < t.size(); ++i) {
+            if (!model.forward({(int32_t) t[i]}, lg, err) || (int64_t) lg.size() < n_vocab) {
+                std::fprintf(stderr, "maya generate: %s\n", err.empty() ? "no logits" : err.c_str());
+                std::fclose(f);
+                return 1;
+            }
+            std::fwrite(lg.data(), sizeof(float), (size_t) n_vocab, f);
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "maya generate: %lld positions' logits in %s\n", (long long) n, path.c_str());
+        return 0;
+    }
+
     const bool stop_on_eos = o.eos_given || o.stop_eos || o.serve;
 
     // ---- stdin on its own thread (the qwen serve's pattern): a STOP line must reach a request that is
@@ -1177,11 +1240,14 @@ static int glm_pack_generate(const Options& o) {
     // it does continue (slot_load) - chats, and an agent's side requests, that interleave no longer re-read each
     // other's prompts.  STRATA_GLM_SLOTS=<n> files (default 4, 0 off), for conversations of STRATA_GLM_SLOT_MIN tokens
     // or more (1024), in STRATA_GLM_SLOT_DIR (default <pack>/slots, emptied at start), at most STRATA_GLM_SLOT_GB on
-    // disk (16) and never below 8 GB free.  Text only: a conversation with pictures is not set aside.
+    // disk (16) and never below 8 GB free.  Text only: a conversation with pictures is not set aside.  Or the slots
+    // live in RAM and nothing reaches the disk: STRATA_GLM_SLOT_RAM_GB (0, off) caps their bytes there - the states
+    // are host buffers that die with the run, so SLOT_DIR, SLOT_GB (1) and the disk-space guard do not apply.
     struct Slot {
         std::vector<int32_t> tokens;
-        std::string path;
+        std::string path;                       // empty when the slot is a RAM buffer (slot_ram)
         uint64_t bytes = 0, used = 0;
+        std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         // a paused request's prompt (PAUSE keep): the next turn of that chat continues it, not the written answer
         // (its history drops the reasoning), so its own continuations do not supersede it until it is taken back
         bool anchor = false;
@@ -1199,6 +1265,12 @@ static int glm_pack_generate(const Options& o) {
     int slot_max = model.fast() && getenv("STRATA_GLM_NO_REUSE") == nullptr ? (int) env_num("STRATA_GLM_SLOTS", 4) : 0;
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_GLM_SLOT_MIN", 1024));
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_GLM_SLOT_GB", 16) * 1073741824.0);
+    // slots in RAM: the conversation's state is parked in a host buffer instead of a file.  The cap moves to RAM too
+    // (slot_cap below); the states die with the run, so SLOT_KEEP, SLOT_DAYS, SLOT_DIR and the 8 GB-free disk guard
+    // are theirs no longer.  Nothing on the disk is touched: in RAM mode the slots folder is neither used nor wiped.
+    const bool slot_ram = env_num("STRATA_GLM_SLOT_RAM_GB", 0) > 0;
+    const uint64_t slot_cap =
+        slot_ram ? (uint64_t) (env_num("STRATA_GLM_SLOT_RAM_GB", 16) * 1073741824.0) : slot_budget;
     // STRATA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
     // and kept when they belong to this model), the conversation in the model is set aside when the engine ends
     // (QUIT or end of input), and a file not used for STRATA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
@@ -1274,7 +1346,9 @@ static int glm_pack_generate(const Options& o) {
         std::snprintf(s, sizeof s, "%.2f GB", (double) b / 1e9);
         return std::string(s);
     };
-    if (slot_max > 0) {
+    if (slot_max > 0 && slot_ram)
+        note("slots parked in RAM (" + gb(slot_cap) + " max) - nothing is written to disk, the states die with the run");
+    if (slot_max > 0 && !slot_ram) {
         slot_dir = getenv("STRATA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("STRATA_GLM_SLOT_DIR"))
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
@@ -1330,9 +1404,13 @@ static int glm_pack_generate(const Options& o) {
         }
     }
     const auto slot_drop = [&](size_t i) {
-        std::error_code ec;
-        std::filesystem::remove(slots[i].path, ec);
-        std::filesystem::remove(meta_of(slots[i].path), ec);
+        if (slots[i].data)                       // a RAM slot: its buffer simply dies
+            slots[i].data.reset();
+        else {
+            std::error_code ec;
+            std::filesystem::remove(slots[i].path, ec);
+            std::filesystem::remove(meta_of(slots[i].path), ec);
+        }
         slots.erase(slots.begin() + (long) i);
     };
     const auto slot_lru = [&](size_t keep) {   // the least recently used slot other than `keep`
@@ -1349,6 +1427,37 @@ static int glm_pack_generate(const Options& o) {
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
         while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
+        if (slot_ram) {   // the conversation is parked in a host buffer; nothing touches the disk
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string e;
+            auto buf = std::make_shared<std::vector<uint8_t>>();
+            buf->reserve(1 << 20);
+            const uint64_t bytes = model.slot_save(*buf, e);
+            if (bytes == 0) {
+                note("setting the conversation aside in RAM failed (" + (e.empty() ? std::string("it did not copy") : e) +
+                     ") - it is not parked and will be read from token 0 when it comes back");
+                return;
+            }
+            slots.push_back({snap_tokens, "", bytes, ++slot_clock});
+            slots.back().data = buf;
+            snap_in_slot = true;
+            uint64_t total = 0;
+            for (const auto& s : slots) total += s.bytes;
+            size_t evicted = 0;
+            while (slots.size() > 1 && total > slot_cap) {
+                const size_t i = slot_lru(slots.size() - 1);
+                total -= slots[i].bytes;
+                slot_drop(i);
+                ++evicted;
+            }
+            char m[288];
+            std::snprintf(m, sizeof m, "saved a %zu-token conversation%s (%s in RAM in %.1f s); %zu kept, %s%s",
+                          snap_tokens.size(), why, gb(bytes).c_str(),
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), slots.size(),
+                          gb(total).c_str(), evicted ? ", least recently used dropped to stay under the RAM cap" : "");
+            note(m);
+            return;
+        }
         std::error_code ec;
         const auto space = std::filesystem::space(slot_dir, ec);
         if (!ec && space.available < (uint64_t) 8 << 30) {
@@ -1376,7 +1485,7 @@ static int glm_pack_generate(const Options& o) {
         uint64_t total = 0;
         for (const auto& s : slots) total += s.bytes;
         size_t evicted = 0;
-        while (slots.size() > 1 && total > slot_budget) {
+        while (slots.size() > 1 && total > slot_cap) {
             const size_t i = slot_lru(slots.size() - 1);
             total -= slots[i].bytes;
             slot_drop(i);
@@ -1403,7 +1512,10 @@ static int glm_pack_generate(const Options& o) {
         if (best == SIZE_MAX) return 0;
         const auto t0 = std::chrono::steady_clock::now();
         std::string e;
-        if (!model.slot_load(slots[best].path, (int64_t) len, e)) {
+        const bool back = slots[best].data
+                              ? model.slot_load(*slots[best].data, (int64_t) len, e)
+                              : model.slot_load(slots[best].path, (int64_t) len, e);
+        if (!back) {
             note("taking a conversation back failed (" + e + ") - reading its prompt again");
             slot_drop(best);
             snap_tokens.clear();
@@ -1414,12 +1526,13 @@ static int glm_pack_generate(const Options& o) {
         snap_in_slot = true;
         slots[best].used = ++slot_clock;
         slots[best].anchor = false;
-        if (slot_keep) {   // its age counts from its last use
+        if (slot_keep && !slots[best].data) {   // its age counts from its last use (a file slot's only)
             std::error_code ec;
             fs::last_write_time(meta_of(slots[best].path), fs::file_time_type::clock::now(), ec);
         }
         char m[160];
-        std::snprintf(m, sizeof m, "took back a %zu-token conversation from disk (%.1f s); %zu new tokens to read", len,
+        std::snprintf(m, sizeof m, "took back a %zu-token conversation from %s (%.1f s); %zu new tokens to read", len,
+                      slots[best].data ? "RAM" : "disk",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                       prompt.size() - len);
         note(m);
@@ -1510,7 +1623,7 @@ static int glm_pack_generate(const Options& o) {
         if (snap_in_slot && !slots.empty() && slots.back().tokens.size() == p) slots.back().prefix = true;
     };
     // the state now (after prompt[0, p)) into a free or the least recently used checkpoint
-    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p) {
+    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
         size_t c = 0;
         for (size_t i = 0; i < ckpts.size(); ++i) {
@@ -1519,7 +1632,7 @@ static int glm_pack_generate(const Options& o) {
         }
         std::string e;
         ckpts[c].tokens.clear();
-        if (!model.ckpt_save((int) c, e)) {
+        if (!(from_snapshot ? model.ckpt_save_snapshot((int) c, e) : model.ckpt_save((int) c, e))) {
             std::fprintf(stderr, "glm checkpoints: not kept at %zu (%s)\n", p, e.c_str());
             return;
         }
@@ -1584,6 +1697,23 @@ static int glm_pack_generate(const Options& o) {
                 std::fprintf(stderr, "glm checkpoints: %s\n", ce.c_str());
                 ckpts[(size_t) ck].tokens.clear();
             }
+        }
+        // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
+        // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
+        // whole conversation again (13.5K tokens: 20.8 s).  The snapshot itself (the previous prompt but its last
+        // token, a few tokens before the turn) is kept as a checkpoint instead: copied to host RAM on a side thread
+        // while this prompt runs, so it costs the prompt nothing.  STRATA_GLM_CKPT_TURN=0: off.
+        if (reuse > 0 && !from_ckpt && reuse == snap_tokens.size() && reuse >= 512 && ckpt_max > 0 &&
+            cur_img_pos.empty()) {
+            static const bool turn_on = [] { const char* v = getenv("STRATA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
+            constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
+            size_t last = 0;
+            for (size_t i = prompt.size() - 1; i-- > reuse;)
+                if (prompt[i] == kUserTok || prompt[i] == kObsTok) { last = i; break; }
+            bool have = false;
+            for (const auto& c : ckpts)
+                have = have || (c.tokens.size() == reuse && std::equal(c.tokens.begin(), c.tokens.end(), prompt.begin()));
+            if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
         }
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
@@ -1731,6 +1861,31 @@ static int glm_pack_generate(const Options& o) {
             }
         }
     };
+    // STRATA_GLM_SPEC_FOLLOW=<file> (--spec-follow): every request decodes this continuation instead of its own picks
+    // and ends with it (Glm5Model::set_follow) - a speed A/B on one text.  STRATA_GLM_SPEC_FOLLOW_SAVE=<file>
+    // (--spec-follow-save): each request's decoded ids are written there, the next run's continuation.  A text made by
+    // another model, or by the same model with other settings, favours the drafts that made it: compare a change on
+    // the same model and its own text.
+    std::vector<int32_t> follow_ids;
+    const char* follow_save = getenv("STRATA_GLM_SPEC_FOLLOW_SAVE");
+    if (follow_save != nullptr && follow_save[0] == '\0') follow_save = nullptr;
+    if (const char* fp = getenv("STRATA_GLM_SPEC_FOLLOW"); fp != nullptr && fp[0] != '\0') {
+        std::ifstream input(fp);
+        std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        std::vector<int64_t> v;
+        std::string e;
+        if (!input && !input.eof()) e = "cannot read it";
+        else if (!parse_i64_list(text.c_str(), v, e)) e = "not a list of token ids: " + e;
+        for (const int64_t t : v)
+            if (e.empty() && t >= n_vocab) e = "token " + std::to_string(t) + " is past the vocabulary";
+        if (!e.empty()) {
+            std::fprintf(stderr, "maya generate: MAYA_GLM_SPEC_FOLLOW %s: %s\n", fp, e.c_str());
+            return 2;
+        }
+        follow_ids.assign(v.begin(), v.end());
+        std::fprintf(stderr, "glm follow: every request decodes the %zu tokens of %s (MAYA_GLM_SPEC_FOLLOW)\n",
+                     follow_ids.size(), fp);
+    }
     const auto run_request = [&](const std::vector<int64_t>& ids, int64_t max_new,
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
@@ -1738,6 +1893,8 @@ static int glm_pack_generate(const Options& o) {
         pause_req.store(false);
         pause_keep.store(false);
         model.force_next(-1);
+        model.set_follow(follow_ids);   // STRATA_GLM_SPEC_FOLLOW: this request's tokens (empty: its own picks)
+        if (!follow_ids.empty()) max_new = std::min<int64_t>(max_new, (int64_t) follow_ids.size());
         bool in_think = req_think_budget > 0 && req_think_end >= 0;
         std::vector<int32_t> prompt;
         prompt.reserve(ids.size());
@@ -1751,6 +1908,12 @@ static int glm_pack_generate(const Options& o) {
         if (prompt.empty() || max_new <= 0) {
             std::printf("ERR empty prompt or max_new\n");
             return 1;
+        }
+        // the penalties' history (#273): what the state is fed - the prompt, then every token written (on_token)
+        std::vector<int32_t> pen_hist;
+        if (sp.penalty_last_n > 0) {
+            pen_hist = prompt;
+            sp.host_history = &pen_hist;
         }
         size_t reuse = 0;
         const char* finish = "length";
@@ -1788,6 +1951,7 @@ static int glm_pack_generate(const Options& o) {
             std::printf("T %d\n", tok);
             ++produced;
             emitted.push_back((int32_t) tok);
+            if (sp.host_history != nullptr) pen_hist.push_back((int32_t) tok);   // (fed next: the picks after count it)
             strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
             strata::core::progress_beat();
             gen_hist.push_back(tok);
@@ -1969,6 +2133,9 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.spec_hits_ - hits0),
                              (unsigned long long) (model.spec_steps_ - spec0),
                              100.0 * (double) (model.spec_hits_ - hits0) / (double) (model.spec_steps_ - spec0));
+            if (!follow_ids.empty())
+                std::fprintf(stderr, "glm follow: %zu tokens of the continuation decoded, %zu of them differ from the "
+                                     "model's own pick\n", model.follow_used(), model.follow_differ());
             if (model.kv_resident() > 0) {
                 // KV streaming, cumulative over the process: the blocks the decode's selections named, and those
                 // read from RAM (every part summed)
@@ -1979,6 +2146,23 @@ static int glm_pack_generate(const Options& o) {
                              (double) kv.misses * kv.block_bytes / 1048576.0,
                              kv.overflow ? " - OVERFLOW (too few resident positions)" : "");
             }
+        }
+        model.set_follow({});
+        // STRATA_GLM_SPEC_FOLLOW_SAVE: this request's decoded ids, the continuation another run can follow
+        if (follow_save != nullptr && !emitted.empty()) {
+            const std::string tmp = std::string(follow_save) + ".tmp";
+            {
+                std::ofstream f(tmp, std::ios::trunc);
+                for (size_t i = 0; i < emitted.size(); ++i) f << (i ? "," : "") << emitted[i];
+                f << "\n";
+            }
+            std::error_code ec;
+            std::filesystem::rename(tmp, follow_save, ec);
+            if (ec)
+                std::fprintf(stderr, "glm follow: could not write %s: %s\n", follow_save, ec.message().c_str());
+            else
+                std::fprintf(stderr, "glm follow: %zu decoded ids written to %s (MAYA_GLM_SPEC_FOLLOW_SAVE)\n",
+                             emitted.size(), follow_save);
         }
         return 0;
     };
@@ -1991,6 +2175,11 @@ static int glm_pack_generate(const Options& o) {
     // request alone decodes through the speculative path (the fastest for one); as soon as a second one comes, both go
     // through the pipelined decode (Glm5Model::multi_issue), each card of the split on a different conversation.
     const bool multi = o.serve && model.fast() && model.seq_count() > 1;
+    if (multi && !follow_ids.empty()) {
+        std::fprintf(stderr, "glm follow: not used with MAYA_GLM_SEQS=%d - one conversation at a time only\n",
+                     model.seq_count());
+        follow_ids.clear();
+    }
     if (multi && model.dflash_ready())
         std::fprintf(stderr, "glm dflash: not used with MAYA_GLM_SEQS=%d - the several-conversation scheduler decodes "
                              "without it (and without the MTP block, which --dflash leaves unloaded)\n",
@@ -2025,6 +2214,7 @@ static int glm_pack_generate(const Options& o) {
         strata::kernels::SamplerParams sp;
         int64_t max_new = 0, produced = 0;
         std::vector<int32_t> prompt, emitted;
+        std::vector<int32_t> pen;   // the penalties' history (sp.host_history): the prompt, then every token written
         bool in_think = false;
         int64_t think_budget = 0;
         int32_t think_end = -1;
@@ -2099,6 +2289,7 @@ static int glm_pack_generate(const Options& o) {
         ++g.produced;
         ++multi_n;
         g.emitted.push_back((int32_t) tok);
+        if (g.sp.host_history != nullptr) g.pen.push_back((int32_t) tok);
         strata::core::progress_at("decode: after token", g.produced);
         strata::core::progress_beat();
         g.hist.push_back(tok);
@@ -2310,6 +2501,10 @@ static int glm_pack_generate(const Options& o) {
         if (g->prompt.empty() || max_new <= 0) {
             std::printf("ERR %d empty prompt or max_new\n", rid);
             return;
+        }
+        if (g->sp.penalty_last_n > 0) {   // its penalties' history (#273; the Gen lives behind a unique_ptr: it stays put)
+            g->pen = g->prompt;
+            g->sp.host_history = &g->pen;
         }
         // the context: an idle one that holds the prompt and the room after it, and whose snapshot this prompt
         // extends (the longest), else the least recently used of those
@@ -2936,6 +3131,35 @@ static int glm_pack_generate(const Options& o) {
         return rc;
     }
 
+    // STRATA_GLM_WARM_PROMPT=<n> (default 0 = off; 32 or more): one synthetic prompt through the whole part chain
+    // before the server is told READY, so the session's first request does not pay what only a session's first
+    // prompt pays (issue #8: it read 95-133 ms/token against 23-44 warm - the first chunk carries the one-time work:
+    // every kernel's first launch, the prompt path's own allocations, the tiers' first reads).  It costs about one
+    // chunk of the smallest part's size (~15 s on a four-way split, beside the tiers' own 90-151 s warm-up), its ids
+    // are spread over the vocabulary so the routes are not one expert's, and the state is zeroed right after it: no
+    // conversation can see it (a request with no slot in use resets anyway, before its own prompt).
+    if (const char* wv = getenv("STRATA_GLM_WARM_PROMPT")) {
+        const int wn = std::atoi(wv);
+        if (wn > 0 && model.prefill_chunk() > 0) {
+            const int wtn = std::max(32, wn);
+            std::vector<int32_t> wids((size_t) wtn);
+            for (int i = 0; i < wtn; ++i) wids[(size_t) i] = (int32_t) (100 + (i * 131) % 20000);
+            std::fprintf(stderr, "glm fast: warming the prompt path with a %d-token prompt before READY "
+                                 "(STRATA_GLM_WARM_PROMPT)\n", wtn);
+            const auto wt0 = std::chrono::steady_clock::now();
+            std::string werr;
+            const bool wok = model.prefill(wids, werr);
+            const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wt0).count();
+            model.reset();
+            if (wok) {
+                std::fprintf(stderr, "glm fast: the prompt path is warm (%d tokens in %.0f ms, %.1f ms/token)\n", wtn,
+                             wms, wms / (double) wtn);
+            } else {
+                std::fprintf(stderr, "glm fast: the prompt warm-up did not run%s%s - the first prompt pays it\n",
+                             werr.empty() ? "" : ": ", werr.c_str());
+            }
+        }
+    }
     // issue #40: a prompt that stopped moving (the GPU idle, a host thread spinning on a flag) waited forever - the
     // server's own stall check counts a spinning thread as work.  A prompt layer or a token is the heartbeat; a big
     // chunk's layer on a slow PC takes seconds, so three minutes of none is a hang.
@@ -3133,6 +3357,8 @@ static int glm_pack_generate(const Options& o) {
             req_spec_cum = -1.0;
             req_bias.clear();
             std::string bias_err;
+            int pen_n = 0;
+            float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
             std::string tok2, ids, emb_path;
             while (ss >> tok2) {
                 const size_t eq = tok2.find('=');
@@ -3181,10 +3407,30 @@ static int glm_pack_generate(const Options& o) {
                         at = end + 1;
                     }
                 }
-                // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
+                // the penalties (#273), llama.cpp's: over the last penalty_last_n tokens the request's state was fed
+                // (its prompt, then what it wrote).  They do not choose between greedy and sampled
+                else if (k == "penalty_last_n") { pen_n = std::atoi(v.c_str()); }
+                else if (k == "penalty_repeat") { pen_repeat = std::strtof(v.c_str(), nullptr); }
+                else if (k == "penalty_freq") { pen_freq = std::strtof(v.c_str(), nullptr); }
+                else if (k == "penalty_present") { pen_present = std::strtof(v.c_str(), nullptr); }
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;
+            // a repeat penalty of 0 or below (some clients' "off"; the logits would be divided by it) or a value that is
+            // not a number counts as neutral
+            if (!std::isfinite(pen_repeat) || pen_repeat <= 0.0f) pen_repeat = 1.0f;
+            if (!std::isfinite(pen_freq)) pen_freq = 0.0f;
+            if (!std::isfinite(pen_present)) pen_present = 0.0f;
+            if (pen_n < 0) pen_n = INT_MAX;   // -1, llama.cpp's "the whole context": every token the window keeps (4096)
+            // as llama.cpp: no window, or every penalty neutral, is no penalty - the request's picks are exactly as
+            // without the keys (no history kept, nothing uploaded)
+            const bool pen_on = pen_n > 0 && (pen_repeat != 1.0f || pen_freq != 0.0f || pen_present != 0.0f);
+            if (pen_on) {
+                rq.penalty_last_n = pen_n;
+                rq.penalty_repeat = pen_repeat;
+                rq.penalty_freq = pen_freq;
+                rq.penalty_present = pen_present;
+            }
             if (!bias_err.empty()) {
                 if (multi && req_rid >= 0) std::printf("ERR %d %s\n", req_rid, bias_err.c_str());
                 else std::printf("ERR %s\n", bias_err.c_str());
@@ -3194,7 +3440,8 @@ static int glm_pack_generate(const Options& o) {
             if (!req_bias.empty() && (rq.greedy || rq.temperature <= 0.0f)) {
                 // greedy with a bias: the sampled path's top_k = 1 is the same argmax (ties to the lower id) over the
                 // biased logits - the greedy shortcuts (the argmax at the end of a forward, the windows' argmax) read
-                // the unbiased ones
+                // the unbiased ones.  (Greedy with penalties stays greedy: every shortcut leaves a request with
+                // penalties to the sampler, whose greedy kernel counts them - the same pick, ~75 us less a token)
                 rq.greedy = false;
                 rq.temperature = 1.0f;
                 rq.top_k = 1;
@@ -3285,14 +3532,14 @@ static int glm_pack_generate(const Options& o) {
                 gen_finish(*gp);
             }
         gen_sweep();
-        if (slot_keep)
+        if (slot_keep && !slot_ram)
             for (int c = 0; c < (int) ctxs.size(); ++c) {
                 bind_ctx(c);
                 slot_put(" on shutdown");
             }
         return 0;
     }
-    if (slot_keep) slot_put(" on shutdown");
+    if (slot_keep && !slot_ram) slot_put(" on shutdown");
     save_profile("quit");   // #477
     strata::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
     return 0;
@@ -3340,6 +3587,7 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
+        bool handled = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--glm-pack") o.glm_pack = next("--glm-pack");
@@ -3443,7 +3691,9 @@ int main(int argc, char** argv) {
             const std::string v = next("--expert-cache");
             o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
         }
-        else if (a == "--expert-cache-device1") o.expert_cache_remote[0] = std::atoi(next("--expert-cache-device1"));
+        else handled = false;
+        if (!handled) {   // (a second chain: MSVC stops an if-else chain this long, C1061 "blocks nested too deeply")
+        if (a == "--expert-cache-device1") o.expert_cache_remote[0] = std::atoi(next("--expert-cache-device1"));
         else if (a == "--expert-cache-device2") o.expert_cache_remote[1] = std::atoi(next("--expert-cache-device2"));
         else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = std::atoi(next("--expert-cache-device3"));
         else if (a == "--expert-cache-remote-placement")
@@ -3465,6 +3715,8 @@ int main(int argc, char** argv) {
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
+        else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
+        else if (a == "--spec-follow-save") o.spec_follow_save = next("--spec-follow-save");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
@@ -3554,6 +3806,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
             usage();
             return 2;
+        }
         }
     }
     // ---- the glm5-next pack path (M3.1): BEFORE every qwen4exp-shaped check below (this driver's
@@ -6440,7 +6693,8 @@ int main(int argc, char** argv) {
             req_sp.seed = req_seed ? req_seed
                                    : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
             req_sp.min_p = std::clamp(req_min_p, 0.0f, 1.0f);
-            req_sp.penalty_last_n = std::max(req_penalty_last_n, 0);
+            // (-1, llama.cpp's "the whole context": the history buffer's whole window, kPenaltyWindowCap)
+            req_sp.penalty_last_n = req_penalty_last_n < 0 ? INT_MAX : req_penalty_last_n;
             req_sp.penalty_repeat = req_penalty_repeat;
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;

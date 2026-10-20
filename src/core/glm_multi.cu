@@ -20,6 +20,7 @@
 namespace strata::core {
 
 void Glm5Model::seq_bind(int s) {
+    ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     if (seq_.empty() || s == cur_seq_ || s < 0 || s >= (int) seq_.size()) return;
     SeqCtx& o = seq_[(size_t) cur_seq_];
     o.state = state_;
@@ -266,11 +267,10 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     }
     // the logits are the tail's shared scratch: the draw goes on the same stream right behind them, before the next
     // sequence's head can write them again
-    if (sp.greedy || sp.temperature <= 0.0f)
+    if ((sp.greedy || sp.temperature <= 0.0f) && sp.penalty_last_n <= 0)   // (penalties: the sampler's greedy pick)
         gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     else
-        strata::kernels::sample_tokens(tail->sc_ + tail->sc_logits, 1, (int) g.n_vocab, nullptr, 0, sp, FT->tok,
-                                       FT->cs);
+        tail->pick_tokens(tail->sc_ + tail->sc_logits, 1, sp, nullptr, 0, FT->tok, FT->cs);
     cudaMemcpyAsync(ct.tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
     cudaEventRecord(ct.ev_done, FT->cs);
     cudaSetDevice(dev_);

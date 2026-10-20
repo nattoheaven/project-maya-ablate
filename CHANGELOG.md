@@ -4,6 +4,94 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.18 - 2026-10-20
+
+DeepSeek-V4.1-Flash-1017 adapts to each PC (faster long prompts on one GPU, decode that uses the GPU's PCIe link when
+it pays, a faster first answer), GLM-5.3-Flash on the Tesla P100, the Responses API, and a round of fixes - among them
+the slower decode on Windows laptops with an AMD Strix Halo since v1.1.17.
+
+- **Windows + AMD Strix Halo: decode back to its speed.** Since v1.1.17 the engines keep an integrated GPU's experts
+  within what Windows can commit (RAM + page file), but they counted only what the page file holds now. Windows grows
+  a page file it manages (its default) as more is committed, so on a laptop giving its GPU 96 GB, most experts stayed
+  off the GPU (decode 17-22 -> 10-15 tokens/s, reported by a user). Both engines now count what the page file may still
+  grow by.
+- **DeepSeek: long prompts on one GPU borrow the experts' VRAM.** While a prompt runs, its buffers take room from the
+  experts' slots, and the experts go back after it, so the decode keeps more experts in VRAM than v1.1.17 did. Prompt
+  chunks grow to 16K or 32K tokens where the room allows, a short prompt's reads stay in the page cache for the answer
+  after it, and after a long prompt the experts its last rows used are read ahead while the first tokens decode. On one
+  GPU by default; several GPUs work as in v1.1.17.
+- **DeepSeek: the PCIe lane.** Of a decoded token's experts that VRAM doesn't hold, some are streamed to the GPU and
+  computed there while the CPU computes the rest, split by this PC's measured costs. Decode checks that streaming pays
+  and turns it off where the CPU alone is faster (`MAYA_DS4_STREAM=0`: off). A low-bit expert now gives the same sums
+  on the CPU and the GPU, so Maya-S's answers depend much less on where its experts are placed.
+- **DeepSeek: tuned to the PC at start.** The CPU lane's way of running (cores, performance cores, one socket) is
+  measured at load, a core's second thread stays with the readers unless asked for (`MAYA_DS4_CPU_LANE`), AMD desktop
+  GPUs keep a VRAM reserve, and a new install starts from a shipped expert profile, so its first answers are faster.
+- **DeepSeek: repetition, frequency and presence penalties**, drafting included, and `repeat_last_n` /
+  `penalty_last_n` as in llama.cpp (0 = off, -1 = the whole context).
+- **DeepSeek: repeatable answers with `--no-expert-cache`**: a request's answer no longer depends on what the process
+  answered before. `MAYA_DS4_DISK_SKIP_AUTO=1` (experimental, with `MAYA_DS4_DISK_SKIP_W`) skips light experts only
+  while the model is cold.
+- **GLM on the Tesla P100** (#261 by @ruibeikaa). The engine builds for compute capability 6.0, and four GP100 decode
+  kernels: Maya-M on four GP100 dies 21.0 -> 28.3 tokens/s, the same answers. Other cards run exactly as before.
+- **The Responses API** (#217 by @Micro-ATP). `POST /v1/responses` with stored conversations, background jobs and
+  structured output, each API key seeing only its own records (`docs/RESPONSES.md`).
+- **GLM: prompts on two GPUs without NVLink, opt-in** (#270 by @sociolog, `MAYA_GLM_PREFILL_CALC=1`): the waiting GPU
+  computes a share of the working one's experts over its own PCIe link (EXL3 experts; +25-48% prompt speed on an
+  RTX 3090 + 3060).
+- **Fixes:** `--calibrate` keeps the config's own CPU-lane settings unless it measures something clearly faster (#277,
+  reported by @klvnblst); MSVC builds (#278, reported by @suprekt) and the Windows test build (#296, reported by
+  @jerem91150); the setup finds ROCm installed from Fedora's own packages (#301, reported by @paxsali); the Monitor's
+  and the CLI dashboard's live tokens/s no longer jump around with drafting (reported on X by @gabu3d_pl); stopping
+  `maya.py` in any way stops the server and the engine too.
+- **Smaller changes:** `--spec-follow` decodes a given continuation, for fair speed A/Bs (#266 by @sociolog);
+  `--check` names the DeepSeek quant it checks (#294 by @boxwrench); the README shows each model's Hugging Face
+  downloads.
+
+## v1.1.17 - 2026-10-20
+
+DeepSeek-V4.1-Flash-1017's prompts many times faster with Maya's quant, all of its files from Maya's repo, and for
+GLM-5.3-Flash the repetition penalties, faster long prompts on Volta and a round of community work.
+
+- **DeepSeek: prompts in chunks with Maya's quant** (#279 by @waxinz). The engine now gives Maya's quant 8192-token
+  prompt chunks by itself. Before, the setup's tensor parallel fell back to one GPU per layer group (the experts'
+  blocks don't split), which also turned the chunks off, so every prompt ran in windows of 16 tokens. On a 7x RTX 3090
+  rig with Maya-S, a 32K-token prompt went from 99 to 1010 tokens/s. A warning at start says when chunks are off and
+  why. The choice between the chunks and the windows for a prompt now follows what each actually took.
+- **DeepSeek: Maya-S as one set of files from Maya's repo.** The model and its Engram tables in one GGUF split of 6
+  files, 339.5 GB (was 381 GB): the Engram tables in Q6_K, made from DeepSeek's released ones, at no measurable cost in
+  quality. Nothing comes from unsloth's repo any more. An install of v1.1.16 keeps its files and works as it is, and so
+  does unsloth's GGUF in its earlier 10 files.
+- **DeepSeek: long prompts read each expert once.** On one GPU, a prompt of several chunks takes each layer through all
+  its chunks before the next layer, and keeps what that layer read from the files in RAM for its later chunks: a
+  16K-token prompt reads 264 GB from the files instead of 736 GB.
+- **DeepSeek: the 3.5-bit EXL3 quant, tensor parallel over 4 / 8 GPUs, cache swaps on threads** (#276 by
+  @needmorevram). `--ds4-quant exl3-3.5` (LibertAIDAI's, 258 GB; RTX 30 / A100 or newer), the tensor parallel groups
+  up to 8 GPUs, and the expert cache's swaps prepared on threads of their own (`DS4_CACHE_THREADS`, 1 by default).
+- **DeepSeek: skipping light experts, opt-in.** `MAYA_DS4_DISK_SKIP_W` / `_FROM` leave out a routed expert that is
+  not in RAM and carries little of the route's weight - faster on PCs whose RAM can't hold the experts, but it changes
+  the answers, so it is off by default (experimental).
+- **GLM: repetition, frequency and presence penalties** (#273, reported by @eliaskg). `repeat_penalty` /
+  `repetition_penalty`, `frequency_penalty` and `presence_penalty` now apply on every GLM decode path, drafting
+  included, and with `temperature` 0 too; requests without them give the same tokens as before.
+- **GLM: long prompts faster on Volta** (#254, #233, #215, #199 by @merbanan). The heavily routed prompt experts as FP16
+  cuBLAS GEMMs (a 27K prompt 41.3 -> 33.4 s), the DSA indexer's scores on the tensor cores, the shared expert in
+  sub-batches, the KDA recurrence over 4 blocks a head.
+- **GLM: short turns faster** (#232 and #253 by @merbanan). Prompts from 8 tokens take the batched path on one GPU
+  (was 32), and the snapshot is kept as a checkpoint when the next turn starts right after it, so an edit of a short
+  reply doesn't read the conversation again.
+- **GLM: opt-ins** - CPU-expert deferral and routing affinity (#252 by @merbanan; +21-26% decode on one V100, changes
+  the answers), conversation slots parked in RAM (#236 by @handmade0octopus), Volta grouped-WMMA prompt experts
+  (#262 by @chenyb999-zhcn, `MAYA_PF_WMMA`), the DFlash verify window on one NUMA node (#197 by @merbanan).
+- **Fixes:** the Monitor's NVML calls run in a reader process of their own, so a crashing call no longer ends the
+  server (#136, reported by @cosmicnag); DFlash2's BF16 drafter no longer faults at its first draft (#173, reported by
+  @waxinz); Windows builds work with a quoted `Path` entry such as `"C:\Program Files (x86)\..."` (#251, reported by
+  @rizh42); GLM on a Windows APU keeps its expert pool within Windows' commit, as DeepSeek's engine does.
+- **Smaller changes:** the server unloads the model after an idle time, opt-in (#250 by @cryptedy); AMD GPU readings
+  from the amdgpu driver on Linux (#269 by @eugenrepp); Visual Studio Build Tools 2026 when the CUDA release supports
+  it (#249 by @rkarp); more than 2 GPUs with HIP (#183 by @izabera); the HIP build only for the chosen cards' archs
+  (#255 by @andrewprock); EXL3 tests against exllamav3 itself (#264 by @sociolog).
+
 ## v1.1.16 - 2026-10-19
 
 DeepSeek-V4.1-Flash-1017 on Maya: Project Maya's own quant of the 748B model, on NVIDIA and AMD, Linux and Windows,

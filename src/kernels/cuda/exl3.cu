@@ -21,6 +21,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <algorithm>
 #include <atomic>
@@ -1358,6 +1359,17 @@ int mv_splits(const Mat& m) {
     int S = 1, kr = 0;
     mv_split(m, sm_count(), mv_occ(m.K), S, kr);
     return S;
+}
+
+int mv_cols(const Mat& m) {
+    if (!supported(m)) return 0;
+#if !defined(STRATA_USE_HIP)
+    if (use_legacy()) return 4;   // (v1.1.8's kernels: the runs of four their callers have always used)
+#endif
+    const int S = mv_splits(m);
+    if (S <= 0) return 0;
+    if (S == 1) return kTok;
+    return (int) std::max<size_t>(1, std::min<size_t>(kTok, kPartFloats / ((size_t) S * m.n)));
 }
 
 int launch_errors() {
