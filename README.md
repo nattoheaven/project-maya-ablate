@@ -57,6 +57,9 @@ The setup also offers **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepse
 (DeepSeek, MIT license; 748 B parameters) on an engine of its own (`maya-ds4`): `./setup.sh --setup` and pick it, or
 `./setup.sh --model DeepSeek-V4.1-Flash-1017`.
 
+The server uses the pinned official prompt encoder, with numeric reasoning budgets and ID-matched parallel tool
+results. See [the prompt format notes](docs/deepseek-prompt-format.md) for API details and the standalone Jinja limits.
+
 | Files | Size | Runs on |
 | --- | ---: | --- |
 | **[Maya-S](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)**, Project Maya's own quant (default): the experts in 2-3 bits, 92.6% the same next token as the original | 340 GB, with the Engram tables (Q6_K) | NVIDIA from Volta (V100) on, and AMD; Linux and Windows |
@@ -178,8 +181,8 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 ## Using it
 
 - **In the browser:** chat (kept in your browser, per-chat instructions, edit and regenerate, HTML previews), a live
-  **Monitor** of the model and your hardware (down to what fills each GPU's memory), and a context size you can change
-  in Settings.
+  **Monitor** of the model and your hardware (down to what fills each GPU's memory), and a context size and port you
+  can change in Settings.
 - **Your apps and coding agents:** an OpenAI-compatible API at `http://127.0.0.1:8080/v1`, and Anthropic's at
   `http://127.0.0.1:8080/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`). Tool calls are
   streamed as the model writes them, and a long prompt's reading progress too when a request asks for it
@@ -194,6 +197,7 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).
+- **DeepSeek on large-RAM Linux hosts:** optional [locked Engram tables and strict CPU-expert RAM placement](docs/SETTINGS.md#deepseek-explicit-ram-residency). Both are off by default; they need enough physical RAM.
 - **Several requests at once** (GLM-5.3-Flash): `./maya.sh --parallel 4` (Windows: `START-MAYA.bat --parallel 4`; up to 8) keeps
   it in the config, and the dashboard shows how many answers are being written. Each extra request keeps its own
   context in VRAM, so a few fewer experts fit there ([how](docs/SETTINGS.md#several-requests-at-once)).
@@ -238,7 +242,8 @@ your setup and the engine's speed lines; nothing is sent anywhere by itself. The
 - **Windows on a Strix Halo / Gorgon Halo: other programs run out of memory, or the setup warns about the page
   file:** set the page file to the size the setup prints ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)).
 - **The download stopped:** run `./maya.sh` again; it continues where it stopped.
-- **Port 8080 is in use:** Maya is already running, or `--port 8081` starts another one.
+- **Port 8080 is in use:** Maya is already running, or `--port 8081` starts another one. Settings > Port moves Maya to
+  another port for good (it starts again there).
 
 ## Support
 
