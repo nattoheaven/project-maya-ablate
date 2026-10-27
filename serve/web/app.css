@@ -23,8 +23,15 @@ main { min-height: 0; min-width: 0; display: flex; }
 .brand__name { font-weight: var(--st-fw-black); font-size: 20px; letter-spacing: -.02em; }
 .brand__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); letter-spacing: .04em; }
 .side__spacer { flex: 1; }
-.side__model { font-size: var(--st-fs-xs); color: var(--st-ink-muted); padding: 0 var(--st-s-2); overflow-wrap: anywhere; }
+.side__model { display: flex; align-items: center; gap: var(--st-s-3); font-size: var(--st-fs-xs); color: var(--st-ink-muted);
+               padding: 0 var(--st-s-2); overflow-wrap: anywhere; }
+.side__model-text { min-width: 0; }
 .side__model b { display: block; color: var(--st-ink-soft); font-weight: 600; font-size: var(--st-fs-sm); }
+/* the model's logo on a small tile, so every mark reads on the light and the dark theme */
+.side__logo { flex: none; display: grid; place-items: center; width: 32px; height: 32px; border-radius: var(--st-r-sm);
+              background: var(--st-surface-2); border: 1px solid var(--st-line); }
+.side__logo img { display: block; width: 20px; height: 20px; }
+[data-theme="dark"] .side__logo--mono img { filter: invert(1); }
 .side__foot { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); }
 .side__foot .st-pill { flex: 1; min-width: 0; }
 #pill-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -435,6 +442,11 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 .drawer-section:not(:first-child) { padding-top: var(--st-s-2); border-top: 1px solid var(--st-line-soft); }
 .st-textarea { height: auto; min-height: 76px; padding: 10px 14px; resize: vertical; font: 400 var(--st-fs-md)/1.45 var(--st-font); }
 .seg--3 { grid-template-columns: repeat(3, 1fr); }
+/* (MiniMax's seven thinking levels: Off and Auto on the first row, its five efforts on the second - no holes, and
+   room for "Medium" on a phone) */
+.seg--many { grid-template-columns: repeat(10, minmax(0, 1fr)); }
+.seg--many button { grid-column: span 2; padding: 0 2px; font-size: 12px; }
+.seg--many button[data-v="none"], .seg--many button[data-v="auto"] { grid-column: span 5; }
 .seg button[aria-pressed="true"] { background: var(--st-surface-3); color: var(--st-ink); font-weight: 650; }
 .ctx-warn { color: var(--st-warn-text); }
 .dirty-bar { position: sticky; bottom: 0; display: flex; align-items: center; gap: var(--st-s-2); flex-wrap: wrap; padding: 10px 12px;
