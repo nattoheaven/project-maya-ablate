@@ -54,6 +54,23 @@ class ModelChoice(unittest.TestCase):
     def test_an_earlier_maya_download_stays_the_default(self):
         self.assertEqual(self.choose({"quant": "Maya-L"})[1], "Maya-L")
 
+    def test_downloads_chosen_by_hand_are_not_in_the_list(self):
+        """v1.1.34: EXL3-sc_4.10bpw is not in the setup's list (maya.MODELS_BY_HAND) but stays a download: --model takes
+        it, and a PC that has it set up lists it as its default (a setup again, --yes included, keeps the model)."""
+        self.assertEqual(maya.MODELS_BY_HAND, ("EXL3-sc_4.10bpw",))
+        self.assertIn("EXL3-sc_4.10bpw", maya.MODELS)
+        kind, quant, text = self.choose({})
+        self.assertNotIn("sc_4.10", text)
+        self.assertIn("GLM-5.3 · EXL3-4.05bpw: download", text)                # (the other EXL3 quants are still listed)
+        self.assertIn("GLM-5.3 · EXL3-3.05bpw: download", text)
+        kind, quant, text = self.choose({"quant": "EXL3-sc_4.10bpw"})
+        self.assertEqual((kind, quant), ("download", "EXL3-sc_4.10bpw"))
+        self.assertIn("GLM-5.3 · EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face   (experimental)", text)
+        args = SimpleNamespace(gguf_dir=None, model="EXL3-sc_4.10bpw", yes=True)   # (by hand: no question at all)
+        self.assertEqual(maya.choose_model(args, Path("/m"), {}), ("download", "EXL3-sc_4.10bpw"))
+        self.assertIsNone(maya.model_option(SimpleNamespace(model="EXL3-sc_4.10bpw", mm3_quant=None)))
+        self.assertTrue(maya.is_exl3("EXL3-sc_4.10bpw"))
+
     def test_every_download_names_a_hash_per_shard(self):
         for q, m in maya.MODELS.items():
             self.assertEqual(set(m["sha256"]), set(maya.shard_names(m)), q)
@@ -151,6 +168,34 @@ class RestartAfterUpdate(unittest.TestCase):
         self.assertEqual(argv[1:3], [str(maya.HERE / "maya.py"), "--yes"])
         self.assertNotIn("--port", argv)               # (this start's --port 8090 would undo it: the config's applies)
         self.assertEqual(argv[argv.index("--gpus") + 1], "0,1")
+
+    def after(self, note, config=None):
+        """after_server for the Models page's restart: the server's note (serve/models.py's SWITCH_FILE) or none."""
+        import json
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            target = d / "maya-gguf-q8-hip.json"
+            target.write_text(json.dumps({"backend": "hip", "args": []}))
+            if note is not None:
+                (d / maya.SWITCH_FILE).write_text(json.dumps({"config": str(target), "time": time.time(), **note}))
+            a = SimpleNamespace(port=8090, host=None, api_key=None, gpu=None, gpus=None, backend="cuda", config=config)
+            with patch.object(maya, "ROOT", d), patch.object(maya, "say"), patch.object(maya, "WIN", False), \
+                    patch.object(maya.os, "execv") as execv:
+                maya.after_server(maya.RESTART_EXIT, a)
+            left = (d / maya.SWITCH_FILE).exists()
+        argv = execv.call_args.args[1]
+        return {f: argv[argv.index(f) + 1] for f in ("--config", "--port", "--backend") if f in argv}, target, left
+
+    def test_a_switch_starts_the_chosen_config_on_the_same_port(self):   # (the Models page's Switch)
+        got, target, left = self.after({"why": "switch", "port": 8123}, config=Path("/x/maya-maya-m.json"))
+        self.assertEqual(got, {"--config": str(target), "--port": "8123", "--backend": "hip"})
+        self.assertFalse(left)                          # (read once: a later port change is not a switch)
+
+    def test_an_old_note_is_not_followed(self):
+        got, _, left = self.after({"why": "switch", "port": 8123, "time": 0}, config=Path("/x/maya-maya-m.json"))
+        self.assertEqual(got, {"--config": "/x/maya-maya-m.json", "--backend": "cuda"})
+        self.assertFalse(left)
 
 
 class RunScript(unittest.TestCase):
@@ -429,6 +474,14 @@ class Exl3DownloadSc410(Exl3Download405):
     Q, GB, SHARDS, REV = "EXL3-sc_4.10bpw", 167.8, 23, "c6b8ac3f6069173343e253e1cba90536ed2c72dc"
     FILES = 33
     MTP = None
+
+    def test_offered_on_nvidia_as_experimental_never_the_default(self):
+        # v1.1.34: out of the setup's list (maya.MODELS_BY_HAND) - named by hand it downloads, packs and starts as before
+        for win in (False, True):   # Linux and Windows alike
+            with patch.object(maya, "WIN", win):
+                quant, text = self.offered("cuda")
+            self.assertNotIn(self.Q, text)
+            self.assertNotEqual(quant, self.Q)
 
     def test_a_405bpw_download_is_not_taken_for_it(self):
         with tempfile.TemporaryDirectory() as d:

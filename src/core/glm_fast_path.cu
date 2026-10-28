@@ -630,9 +630,10 @@ bool Glm5Model::fast_setup(std::string& err) {
     auto* F = new FastState();
     fast_ = F;
     // Not on Windows: there an APU's GPU memory is a fixed carve-out (AMD's Variable Graphics Memory, or the BIOS)
-    // that Windows does not count as RAM, so it is sized like a discrete card - the pool from what HIP reports free,
-    // the RAM tier from the free RAM and commit (below)
-#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+    // that Windows does not count as RAM, so it is sized like a discrete card - the pool from what the runtime reports
+    // free, the RAM tier from the free RAM and commit (below).  On Linux an integrated device's memory IS the system's
+    // (Ryzen AI Max APUs, and GB10 / Grace on CUDA): the pool is sized from the RAM that is actually available.
+#if !defined(_WIN32)
     int integrated = 0;
     if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_) == cudaSuccess)
         F->unified_memory = integrated != 0;
@@ -1114,10 +1115,13 @@ bool Glm5Model::fast_setup(std::string& err) {
                              dev_, (double) sc / 1048576.0);
             }
         }
-#if defined(STRATA_USE_HIP)
+#if !defined(_WIN32)
         if (F->unified_memory) {
-            // Measure after dense/KV/scratch and pinned prompt staging are allocated.
-            // Prompt device buffers borrow the pool, so their budget is not subtracted again.
+            // Measure after dense/KV/scratch and pinned prompt staging are allocated.  The runtime's free figure counts
+            // the model's file-backed page cache as used (on a GB10 it reads ~2 GB free with the 90 GB pack cached),
+            // but MemAvailable leaves the reclaimable cache out - the pool may take it, and the kernel evicts the
+            // cache as the experts are read back in.  Prompt device buffers borrow the pool, so their budget is not
+            // subtracted again.
             long long avail_kb = 0;
             if (FILE* mf = std::fopen("/proc/meminfo", "r")) {
                 char line[256];
@@ -1133,12 +1137,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                 const auto& Ly = F->L[(size_t) il];
                 if (Ly.moe) expert_bytes += (size_t) g.n_expert * glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
             }
-            avail = glmfast::expert_pool_budget(true, free_b, (size_t) std::max(0LL, avail_kb) * 1024,
-                                                reserve, (size_t) (head_gb * 1073741824.0), expert_bytes);
-            std::fprintf(stderr, "glm fast: HIP%d unified memory: MemAvailable %.2f GB, headroom %.2f GB + "
-                                 "%zu MB reserve, experts need %.2f GB, pool budget %.2f GB\n", dev_,
-                         (double) avail_kb / 1048576.0, head_gb, reserve >> 20,
-                         (double) expert_bytes / 1073741824.0, (double) avail / 1073741824.0);
+            if (avail_kb > 0 && expert_bytes > 0) {
+                avail = glmfast::expert_pool_budget(true, free_b, (size_t) avail_kb * 1024, reserve,
+                                                    (size_t) (head_gb * 1073741824.0), expert_bytes);
+                std::fprintf(stderr, "glm fast: CUDA%d unified memory: MemAvailable %.2f GB, headroom %.2f GB + "
+                                     "%zu MB reserve, experts need %.2f GB, pool budget %.2f GB\n", dev_,
+                             (double) avail_kb / 1048576.0, head_gb, reserve >> 20,
+                             (double) expert_bytes / 1073741824.0, (double) avail / 1073741824.0);
+            }
         }
 #endif
         if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
@@ -1201,12 +1207,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         // only the tail, the decode never misses, the RAM tier is staging only and the CPU lane has nothing to take.
         // Any device whose budget holds it (a discrete card too: the slots past the experts cost only budget nothing
         // else used); Linux's unified-memory budget is the experts' bytes exactly, so it keeps its own policy there.
-        // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on AMD only (on_by_default_on_amd).
+        // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on every GPU (complete_pool_on, #474).
         {
             int k_full = pf_ != nullptr ? tail_slots(prefill_borrow_bytes()) : 0;
             if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
                 k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
-            const int full = glmfast::on_by_default_on_amd("STRATA_GLM_COMPLETE_POOL") && !F->unified_memory
+            const int full = glmfast::complete_pool_on() && !F->unified_memory
                                  ? glmfast::complete_pool_slots(avail, stride_sum, g.n_expert, gf::kSpares, k_full)
                                  : 0;
             if (full > 0) {
@@ -3101,7 +3107,17 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
     } else {
-        F->cpu_pool.reset(new glmfast::Workers(threads - 1, 20000, pin_cpus));
+        // STRATA_GLM_CPU_LANE_MAX=N, more than the lane's count: the pool holds N threads and starts with the lane's
+        // count active (the rest sleep), so a request's cpu_threads can try up to N without a restart - the setup's
+        // calibration (tools/calibrate_glm.py) measures counts above the engine's own with it.  A KVM guest's 16
+        // vCPUs, no SMT siblings: two thirds of them (10) 14.9 tok/s, 14 18.4 (Maya-L, one 3090 Ti, #177)
+        const char* mx = getenv("STRATA_GLM_CPU_LANE_MAX");
+        const int pool_n = mx != nullptr ? std::max(threads, std::min(64, std::atoi(mx))) : threads;
+        F->cpu_pool.reset(new glmfast::Workers(pool_n - 1, 20000, pin_cpus));
+        if (pool_n > threads) {
+            F->cpu_pool->set_active(threads);
+            F->cpu_threads0 = threads;
+        }
         F->cpu_node = pin_node;
         F->cpu_pin = pin_cpus;
     }
@@ -3140,6 +3156,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             const bool lane_pin = win_lanes != 2;
             if (lane_pin) {
                 F->cpu_pool.reset(new glmfast::Workers(ta - 1, 20000, ca));
+                F->cpu_threads0 = 0;
                 F->cpu_node = groups[a].first;
                 F->cpu_pin = ca;
             }
@@ -3151,7 +3168,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                      "%d, %d on node %d\n", dev_, ta, groups[a].first, tb, groups[b].first);
             else
                 std::fprintf(stderr, "glm fast: CUDA%d a verify window's tokens on two CPU lanes of %d and %d threads, "
-                                     "unpinned\n", dev_, F->cpu_pool->size(), tb);
+                                     "unpinned\n", dev_, F->cpu_pool->active(), tb);
         }
     }
     // STRATA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
@@ -4077,12 +4094,16 @@ int Glm5Model::cpu_lane_threads() const {
     return fast_ != nullptr && fast_->cpu_pool != nullptr ? fast_->cpu_pool->active() : 0;
 }
 
+int Glm5Model::cpu_lane_threads_max() const {
+    return fast_ != nullptr && fast_->cpu_pool != nullptr ? fast_->cpu_pool->size() : 0;
+}
+
 bool Glm5Model::set_cpu_lane_threads(int n) {
     bool any = false;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         FastState* F = m->fast_;
         if (F == nullptr || F->cpu_pool == nullptr) continue;
-        F->cpu_pool->set_active(n > 0 ? n : F->cpu_pool->size());
+        F->cpu_pool->set_active(n > 0 ? n : F->cpu_threads0 > 0 ? F->cpu_threads0 : F->cpu_pool->size());
         any = true;
     }
     return any;
@@ -6059,7 +6080,22 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
     if (!unified)
         std::tie(b.reserve, b.adapted) =
             glmfast::pool_reserve(free_b, b.reserve, b.reserve_given, b.fixed > 0, floor_b, (size_t) 300 << 20);
-    b.avail = glmfast::expert_pool_budget(false, free_b, 0, b.reserve, 0, 0);
+    if (unified) {
+        // The runtime's free figure counts the model's reclaimable page cache as used: size from MemAvailable instead
+        // (the same number fast_setup logs, before its expert_bytes cap - the prompt path sizes against this too).
+        const int64_t ram = avail_ram_now();
+        double head_gb = 16.0;
+        if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+        const size_t head = (size_t) (head_gb * 1073741824.0);
+        if (ram > 0) {
+            const size_t room = (size_t) ram > head ? (size_t) ram - head : 0;
+            b.avail = room > b.reserve ? room - b.reserve : 0;
+        } else {
+            b.avail = free_b > b.reserve ? free_b - b.reserve : 0;   // (no /proc/meminfo: the old figure)
+        }
+    } else {
+        b.avail = glmfast::expert_pool_budget(false, free_b, 0, b.reserve, 0, 0);
+    }
     if (b.fixed > 0 && slot_b > 0) b.avail = std::min(b.avail, (size_t) b.fixed * slot_b);
 
     if (const char* cap = getenv("STRATA_GLM_POOL_GB"))

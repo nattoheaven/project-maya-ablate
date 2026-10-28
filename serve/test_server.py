@@ -595,6 +595,14 @@ class SamplingKeys(unittest.TestCase):
         for bad in (0, 17, True, 4.0, "6"):
             self.assertFalse([x for x in self.keys(strata_tune={"spec": bad}) if x.startswith("spec=")], bad)
 
+    def test_suffix_draft_tune_key(self):
+        # the DeepSeek engine's prompt lookup for one request (an A/B in one engine): 0 or 1, nothing else
+        self.assertIn("suffix_draft=0", self.keys(temperature=0, strata_tune={"suffix_draft": 0}))
+        self.assertIn("suffix_draft=1", self.keys(temperature=0.7, strata_tune={"suffix_draft": 1}))
+        for bad in (2, -1, True, 1.0, "1"):
+            self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"suffix_draft": bad})
+                              if k.startswith("suffix_draft=")], bad)
+
     def test_read_chunks_tune_key(self):
         # setup's calibration of the disk reads' size (#67): 1-16 pieces, nothing else
         self.assertIn("read_chunks=4", self.keys(temperature=0, strata_tune={"read_chunks": 4}))
@@ -1292,6 +1300,42 @@ class SharedSettings(unittest.TestCase):
         self.assertEqual(self.svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
         self.assertEqual(self.svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
 
+    def test_top_k_and_min_p_off_win_over_the_run_config(self):
+        """The page's Top-k / Min-p "off" (0, sent as such): the run config's or the shared ones applied while the page
+        said off; and /health shows the config's min-p, so the page's slider starts at the model's own."""
+        self.svc.sampling_defaults = {"temperature": 1.0, "top_p": 0.95, "top_k": 40, "min_p": 0.02}
+        try:
+            code, _ = self.chat(temperature=1.0, top_p=0.95, top_k=0, min_p=0)
+            self.assertEqual(code, 200)
+            got = self.engine.last_sampling
+            self.assertEqual((got["top_k"], got["min_p"]), (0, 0))
+            keys = StrataEngine.sampling_keys(got)            # (the engine's GEN line: no min-p, top-k's widest)
+            self.assertNotIn("min_p=", keys)
+            self.assertIn("top_k=64", keys)
+            code, b = self.req("/settings", {"defaults": {"temperature": 1.0, "top_p": 0.9, "top_k": 0, "min_p": 0}})
+            self.assertEqual((code, b["defaults"]["top_k"]), (200, 0), b)
+            with urllib.request.urlopen(self.base + "/health", timeout=30) as resp:
+                self.assertEqual(json.loads(resp.read())["defaults"]["min_p"], 0.02)
+        finally:
+            self.svc.sampling_defaults = {}
+
+    def test_penalties_only_when_set(self):
+        """The Chat's penalties (blank by default: none sent, no model has any as a standard): a request's reach the
+        engine's GEN line; the shared settings carry them when set and refuse a bad one."""
+        code, _ = self.chat(temperature=1.0)
+        self.assertEqual(code, 200)
+        self.assertEqual(StrataEngine.penalty_keys(self.engine.last_sampling), "")      # (none: none sent)
+        code, _ = self.chat(temperature=1.0, repetition_penalty=1.2, frequency_penalty=0.3, presence_penalty=0.4)
+        keys = StrataEngine.sampling_keys(self.engine.last_sampling)
+        for k in ("penalty_repeat=1.2", "penalty_freq=0.3", "penalty_present=0.4", "penalty_last_n=64"):
+            self.assertIn(k, keys)
+        code, b = self.req("/settings", {"defaults": {"temperature": 1.0, "repetition_penalty": 1.1, "presence_penalty": 0.5}})
+        self.assertEqual((code, b["defaults"]["repetition_penalty"], b["defaults"]["presence_penalty"]), (200, 1.1, 0.5), b)
+        self.chat()
+        self.assertIn("penalty_repeat=1.1", StrataEngine.sampling_keys(self.engine.last_sampling))
+        code, b = self.req("/settings", {"defaults": {"repetition_penalty": 0}})
+        self.assertEqual(code, 400)
+
     def test_off_again(self):
         self.req("/settings", {"defaults": {"temperature": 0.3}})
         code, b = self.req("/settings", {"defaults": None})
@@ -1478,8 +1522,8 @@ class WebApp(unittest.TestCase):
             self.svc.model_label = None
         self.assertEqual((health["model_label"], health["model"]), ("MiniMax M3.1 · Maya-XS", self.svc.model))
         self.assertIsNone(json.loads(self.get("/health")[2])["model_label"])   # (a hand-written config: the id)
-        app = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
-        self.assertIn("health.model_label || modelDisplayName(health.model)", app)
+        side = (ROOT / "serve/web/sidebar.js").read_text(encoding="utf-8")   # (the sidebar's model card)
+        self.assertIn("S.health.model_label || modelName(S.health.model)", side)
 
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
