@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import random
@@ -14,6 +15,7 @@ import time
 import unittest
 import unittest.mock
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -80,13 +82,22 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_small_limits_leave_reasoning_and_answer_room(self):
         for api in ("openai", "anthropic", "responses"):
-            for limit in (128, 512, 1024, 2048, 8192):
+            for limit in (128, 512, 1024):
                 with self.subTest(api=api, limit=limit):
                     sampling = self.call(api, limit)
                     budget = sampling["_think_budget"]
                     self.assertGreaterEqual(budget, limit // 2 - 1)
                     # The forced closing marker is an output token too.
                     self.assertLessEqual(budget + 1, limit - limit // 4)
+
+    def test_larger_limits_keep_the_configured_budget(self):
+        # a chat client's max_tokens (Open WebUI's 4096, say) is a cap on the whole output, not a reason to close
+        # the thinking early: only a tiny limit (THINK_TINY_LIMIT or fewer tokens) lowers the budget
+        from serve.server import THINK_TINY_LIMIT
+        for api in ("openai", "anthropic", "responses"):
+            for limit in (THINK_TINY_LIMIT + 1, 2048, 4096, 8192):
+                with self.subTest(api=api, limit=limit):
+                    self.assertEqual(self.call(api, limit)["_think_budget"], 32768)
 
     def test_configured_budget_and_thinking_off(self):
         old = self.svc.think_budget
@@ -496,6 +507,36 @@ class StableToolOrder(unittest.TestCase):
         nameless = [{"description": "?"}, {"name": "t_y"}]
         self.assertIs(stable_tool_order(nameless), nameless)
         self.assertIsNone(stable_tool_order(None))
+
+    def test_deepseek_paths_are_stabilized_too(self):
+        # the DeepSeek converters skipped stable_tool_order, so one swap on the DS4 path (an agent client's
+        # or an MCP hub's tool order) re-rendered the tools at the prompt's head in a new order and the engine
+        # re-read the whole conversation.  Unique names: _TOOL_ORDERS is process-global.
+        from serve.frontend import anthropic_to_messages, openai_to_messages
+
+        def oa(*names):
+            return openai_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": [
+                {"type": "function", "function": {"name": n, "parameters": {}}} for n in names]}, deepseek=True)[1]
+
+        def an(*names):
+            return anthropic_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": [
+                {"name": n, "input_schema": {}} for n in names]}, deepseek=True)[1]
+
+        self.assertEqual(self.names(oa("ds_a", "ds_b", "ds_c")), ["ds_a", "ds_b", "ds_c"])   # first sight
+        self.assertEqual(self.names(oa("ds_c", "ds_a", "ds_b")), ["ds_a", "ds_b", "ds_c"])
+        self.assertEqual(self.names(an("ds_b", "ds_c", "ds_a")), ["ds_a", "ds_b", "ds_c"])  # the same set
+
+    def test_deepseek_namespaced_tools_key_on_the_encoding_name(self):
+        from serve.frontend import openai_to_messages
+
+        def oa(*tools):
+            return openai_to_messages({"messages": [{"role": "user", "content": "q"}], "tools": list(tools)},
+                                      deepseek=True)[1]
+
+        one = {"type": "function", "namespace": "nsx", "function": {"name": "probe", "parameters": {}}}
+        two = {"type": "function", "function": {"name": "plain", "parameters": {}}}
+        self.assertEqual(self.names(oa(one, two)), ["nsx::probe", "plain"])
+        self.assertEqual(self.names(oa(two, one)), ["nsx::probe", "plain"])
 
 
 class ClientShapes(unittest.TestCase):
@@ -1524,6 +1565,27 @@ class WebApp(unittest.TestCase):
         self.assertIsNone(json.loads(self.get("/health")[2])["model_label"])   # (a hand-written config: the id)
         side = (ROOT / "serve/web/sidebar.js").read_text(encoding="utf-8")   # (the sidebar's model card)
         self.assertIn("S.health.model_label || modelName(S.health.model)", side)
+
+    def test_home_screen_start_url(self):
+        """The manifest's start_url and scope resolve to the page, not to /web/ (iOS's Add to Home Screen opened a 404);
+        an icon saved with the old /web/ is sent to the page."""
+        code, _, body = self.get("/web/manifest.webmanifest")
+        self.assertEqual(code, 200)
+        man = json.loads(body)
+        base = self.base + "/web/manifest.webmanifest"
+        for key in ("start_url", "scope"):
+            self.assertEqual(urllib.parse.urljoin(base, man[key]), self.base + "/")
+        for path, loc in (("/web/", "../"), ("/web", "./"), ("/web/?q=hi", "../?q=hi")):
+            with self.subTest(path=path):
+                conn = http.client.HTTPConnection(self.base.split("//")[1], timeout=10)
+                conn.request("GET", path)
+                r = conn.getresponse()
+                self.assertEqual((r.status, r.getheader("Location")), (302, loc))
+                conn.close()
+                self.assertEqual(urllib.parse.urljoin(self.base + path, loc).split("?")[0], self.base + "/")
+        code, _, body = self.get("/web/")   # (followed: the page)
+        self.assertEqual(code, 200)
+        self.assertIn(b"\"web/app.js\"", body)
 
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
