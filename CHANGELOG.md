@@ -4,6 +4,172 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.41 - 2026-10-30
+
+A community release: 36 contributions. DeepSeek reads the first long prompt after a start about 1.3x faster on
+multi-GPU PCs and is faster on PCs short of RAM, agents get a loop guard that works across turns and a cancelled
+prompt read that is resumed, Open WebUI can manage the model, and AMD GPUs get faster GLM prompts on Strix Halo, the
+DFlash2 drafter on one Ryzen AI Max APU and early Instinct support. Against v1.1.40 on our test PCs, decode and
+prompt speeds are otherwise unchanged (GLM, DeepSeek on one and on three GPUs, MiniMax, Qwen).
+
+- **DeepSeek: the first long prompt after a start is read about 1.3x faster** on a multi-GPU PC (#612, thanks
+  @Whamp): a short warm-up's timing no longer misleads the engine's choice of how to read a long prompt. On three
+  V100s (`--tp 2`) the first 8K-token prompt now reads as fast as the ones after it.
+- **DeepSeek on a PC short of RAM** (#669, thanks @xiongqiyang): with `--mmap-experts off`, the experts copied to RAM
+  are now shared fairly between the layers, so no layer is left with none. On our RAM-limited test (32 GB, one GPU)
+  a long answer took about 20% less time, with the later part about 2x faster, and the same tokens.
+  `--mmap-experts auto` (the default) is unchanged. `DS4_COPY_FAIR=0` restores the old order.
+- **Agents:**
+  - The loop guard now works across turns (#640, thanks @merbanan): an agent that makes the same tool call with the
+    same result a third time gets a short note in its prompt, and one that keeps going is steered off it. Normal
+    agent conversations, and a call repeated after an edit, get exactly the same prompt as before. On by default.
+  - GLM: a cancelled prompt read keeps its last checkpoint, so an agent that times out and retries goes on from there
+    instead of reading the whole prompt again (#573, thanks @rushisan). Keeping the snapshot before the generation
+    prompt, so a cancelled answer's next prompt continues it, is opt-in for now (`MAYA_GLM_SNAP_GEN=1`, #572, thanks
+    @rushisan).
+  - Very long streamed tool arguments no longer slow down as they grow, and streamed replies are sent without delay
+    (#626, thanks @SeriousRising).
+- **Server and clients:**
+  - Open WebUI's Models page can load the model, free its GPU memory and watch its state through llama.cpp's
+    `/models/load`, `/models/unload` and `/models/sse` - off unless `"model_management": true` is in the config
+    (#678, thanks @rilken-star).
+  - `/v1/models` lists each model's `context_length` for clients that size their requests by it (#649, thanks
+    @NorwinYu).
+  - `/status` asks for the API key when one is set, and a request during an engine start gets a retryable 503
+    (#677, thanks @rilken-star). A reply that ends or is cancelled keeps its final statistics (#652, thanks
+    @LostVector).
+- **AMD GPUs:**
+  - Strix Halo: GLM's prompt experts run with a better occupancy for GLM's shape - about 11% less time for that step
+    on our Halo, the same results bit for bit (#634, thanks @mrsirg97-rgb).
+  - One Ryzen AI Max APU (Strix / Gorgon Halo) is offered the DFlash2 drafter for GLM in the setup; MTP stays the
+    default and the speed calibration keeps DFlash2 only where it is faster (#628, thanks @mrsirg97-rgb).
+  - A hipBLASLt tuning preset for GLM's prompt GEMMs, and a warning when a shape is not in the table (#582, thanks
+    @precisionailabsllc-collab).
+  - EXL3: a specialised one-row decode kernel by default (#470), configurable prompt tiles on RDNA4 (#593) and RDNA4
+    matrix prefill, opt-in with `EXL3_WMMA_GFX12=1` until we can measure it (#365) - thanks @LostVector.
+  - Experimental Instinct MI300X / MI325X (gfx942) and MI350X / MI355X (gfx950) support, compile-checked (#468, #581,
+    thanks @yagop).
+  - DeepSeek on two AMD GPUs: an exact peer-VRAM transport for prompts, opt-in (`MAYA_DS4_HIP_PEER_AR=auto`) until a
+    two-GPU AMD PC has measured it (#592, thanks @LostVector). The PCIe lane's timing uses the GPU clock on RDNA3 /
+    RDNA4, and `DS4_IQ1S_ROWS` chooses IQ1_S's own CPU rows (#563, thanks @Cass67).
+- **GLM:**
+  - The expert pool keeps at least one route's experts of every size class, so mixed-recipe GGUFs no longer evict
+    their own route (#660, thanks @Cass67).
+  - IQ1_S / IQ2_S / IQ3_S prompts no longer read garbage on Windows with CUDA 13.2 (#487, thanks @Fringe210).
+  - Prompt GEMVs over IQ weights read each weight block once per batch of columns, bit for bit as before (#560,
+    thanks @precisionailabsllc-collab), and two small route-kernel optimisations (#451, #486, thanks @merbanan).
+  - Windows + NVIDIA, one GPU: a balanced RAM-resident expert plan, opt-in with `MAYA_GLM_RAM_BALANCED=1` (#153,
+    thanks @PhysicistLeon).
+- **DeepSeek:**
+  - Pictures: the vision tower no longer comes out zero when built with C++20 and CUDA 12.1 (#676, thanks
+    @rilken-star).
+  - DSpark's drafter skips the rows a round cannot keep, with the same drafts (#622, thanks @SeriousRising).
+  - `--experts N`: a token takes the router's top N experts (lossy; an engine flag for experiments, #564, thanks
+    @Cass67).
+  - Drafter and verification timings in the STAT line and `/metrics/prometheus` (#647), and opt-in placements for
+    a helper GPU with EXL3 experts and for DSpark's blocks (#527), with the helper's experts shown on their own in
+    the Monitor (#599) - thanks @LostVector.
+- **CPU lane:** IQ1_M and IQ2_XS rows that are faster on AVX2 CPUs (#623, thanks @SeriousRising) and an AVX-512 VNNI tier for EXL3 rows on
+  CPUs that have it (#596, thanks @sbleschke), both bit for bit.
+- **MiniMax:** reports include the engine's load summary and image setting (#667, thanks @tobitege).
+- **Docs:** the Intel Arc page is up to date with stock llama.cpp (#674, thanks @Jumbomuffin777).
+- The README's download badges are served from this repository, so they no longer time out.
+
+## v1.1.40 - 2026-10-30
+
+Experimental Mac support: GLM-5.3-Flash on Apple silicon, from a community contribution. DeepSeek's restore point
+near a prompt's tail is now judged by its real cost on multi-GPU layer splits, and the dashboard got a few fixes.
+
+- **Mac with Apple silicon, experimental (GLM-5.3-Flash only)** (#334, thanks @hotocoo): a new engine, `maya-metal`,
+  runs GLM-5.3-Flash on the GPU of an M1 or newer Mac through Metal, with the same dashboard and the same OpenAI- and
+  Anthropic-compatible API as on Linux and Windows (streamed answers, tool calls, thinking levels, pictures).
+  `./maya.sh --backend metal --setup` builds it and downloads the model; on a Mac, `./maya.sh` picks Metal by itself.
+  See [docs/METAL.md](docs/METAL.md).
+  **This is experimental.** Every change is built and unit-tested on GitHub's Apple silicon runners, but we have no
+  Mac and have not run it with the real model, so expect rough edges. If you try it, please tell us how it went in an
+  issue: the chip and its memory, the model, the speed `./maya.sh --bench` prints, and anything that went wrong
+  (`./maya.sh --report` collects the details). DeepSeek, MiniMax and Qwen stay NVIDIA / AMD only for now, and a Mac
+  GPU without Apple silicon's matrix support (a virtual machine's, for example) gets a clear message instead of a
+  crash. The Mac engine is only built on a Mac; for NVIDIA and AMD users the only changes from #334 are the
+  server and download points at the end of these notes.
+- **DeepSeek: the restore point near a prompt's tail is judged by its measured time per token** (#668, thanks
+  @creslinux for the measurements): on a layer split (`--tp 1`) whose experts mostly stay outside VRAM, v1.1.39 kept
+  that point although its short run cost several times more per token than the rest of the read - a few seconds
+  added to every fresh prompt. The engine now compares the two runs' wall time per token and, after its first two
+  measured reads, leaves the point out wherever it costs more than reading its tokens again. On three V100s fresh
+  prompts then read about 1.3-1.4x faster with 10% of the experts in VRAM (4-8K tokens), and took 7-17% less time
+  with the default placement, about three quarters of the experts in VRAM (4-16K tokens), where the point is now
+  left out too. Editing the last message
+  still restarts from the last user message, and the system-prompt reuse from v1.1.39 is unchanged. One GPU and the
+  CPU lane decide as before. `MAYA_DS4_RESTORE_TAIL_AUTO=0` keeps the point on every read.
+- **Dashboard:**
+  - Monitor: the peak decode speed now follows the live Decode figure, so the live number no longer sits above the
+    peak.
+  - Monitor: the Context card says clearly what the VRAM window is (with KV streaming, how much of a chat's cache
+    stays in GPU memory) and where it is set.
+  - Models page: Engine settings > Context size is now the same slider as Settings > Model, up to each model's own
+    trained context (1M for GLM, DeepSeek and MiniMax), with the same memory line under it.
+  - Chat: the thinking-level picker highlights only the level that is chosen (Low no longer lit Off as well).
+  - Models page: GLM on an AMD GPU says why Images is off (the setup does not build GLM's image encoder for AMD GPUs
+    yet).
+- Also from #334, for every platform: the server refuses requests that a web page of another site sends to it
+  unless the config's `cors_origins` lists that page (curl, SDKs and apps like Open WebUI are not affected), a
+  connection that stalls in the middle of a request is closed after 5 minutes (a long answer is not cut), and a
+  downloaded model file whose checksum does not match is removed so the next setup fetches it again.
+
+## v1.1.39 - 2026-10-29
+
+DeepSeek reuses a shared system prompt across conversations (a new conversation's first token about 19x sooner),
+GLM decodes about 22% faster when it reads experts from the SSD, more Strix Halo builds read GLM prompts with a tuned
+table, and model files downloaded some other way can be imported.
+
+- **DeepSeek: a new conversation behind the same system prompt and tools answers about 19x sooner** (#607): the
+  engine keeps the state at the end of a system prompt and its tools apart from any one conversation (in RAM, about
+  20 MB for an 11K-token prompt with 12 tools), so a new chat, a sub-agent or another `--parallel` conversation reads
+  only its own part instead of the whole system prompt again. On one V100 with Maya-XS the first token came about 19x
+  sooner after an unrelated chat, and about 25x sooner with `--parallel 2` while another conversation was answering.
+- **GLM: decode about 22% faster when experts are read from the SSD** (#570, thanks @pschaub for the idea): an expert
+  read from the SSD now goes to the GPU piece by piece as it arrives instead of after the whole read. Measured on a
+  V100 PC whose RAM holds only part of the experts; a PC that holds every expert in RAM is unchanged.
+  `MAYA_GLM_STREAM_FETCH=0` turns it off.
+- **Strix Halo: GLM prompts about 1.9x faster on hipBLASLt 1.4.1 builds that rejected the shipped table** (#631,
+  thanks @mrsirg97-rgb): a second tuned table ships beside the first, and the engine now uses, for each prompt shape,
+  the first table the installed hipBLASLt accepts, so both AMD's Windows wheels and Linux ROCm 7.15 builds get a
+  tuned table. On Windows a table on another drive than the engine now loads too.
+- **Import model files downloaded some other way** (#666): `./maya.sh --import-model FOLDER` finds Maya's published
+  model files in a folder (any names, subfolders, a Hugging Face cache) by size and sha256, moves them into place
+  (`--copy` copies them instead) and says what is still missing. Files that do not match are never touched.
+- **Chat: the text-file limit follows the context** (#635): instead of a fixed 512 KB it goes from 512 KB to 16 MB
+  with the context; a file over it gets a message that names the context and where to raise it.
+- **DeepSeek: the prompt ring is sized by each GPU's link** (#609), measured at load: a slow PCIe link gets a smaller
+  ring and waits less for each batch, a fast link keeps the 400 MB it had.
+- **MiniMax setup: the recommended context counts where its KV cache lives** (#663): on a Windows APU with about
+  32 GB of RAM beside its GPU memory, and on a 24 GB card with 128 GB of RAM, it now suggests 128K instead of the 256K
+  that about halved the speed there. Other PCs, GLM, DeepSeek and Qwen are unchanged; `--context` still wins.
+- **Monitor on Windows + AMD** (#102): GPU load and memory are now shown, from Windows' own GPU counters.
+- Every prompt read logs one line for GLM and DeepSeek with the tokens read, the time and the free VRAM before and
+  after, per GPU (#648).
+- A stopped request is now drained to its end with one conversation (#603, thanks @merbanan; #536): a client that
+  went away during a long prompt read could make every later request get the answer of the one before.
+- DeepSeek: the restore point near a prompt's tail now leaves itself out where it costs more than it saves, so a fresh
+  long prompt on a PC with most experts outside VRAM is no longer about 13% slower than before v1.1.37; an edited last
+  message still restarts from the last user message (#668).
+- The thinking budget closes the reasoning at a sentence or line end instead of mid-word, and a malformed tool call
+  no longer fails the whole answer (#613).
+- DeepSeek on Radeon PRO V620 (gfx1030, 2 or 4 cards): short prompts no longer hang (#621).
+- DeepSeek on Windows with NVIDIA: a PC with a lot of RAM for copied experts no longer fails to start with
+  "cudaHostAlloc failed" (#589).
+- Qwen on 2 GPUs: no more "illegal memory access" on the first long prompt (#645); GLM's prompt path got the same
+  safety margin.
+- `--dump-logits` writes every row with a native (IQ) pack too (#658).
+- After an update, a shared build compiles the other model's engine before it starts (#665, thanks @tobitege; #664).
+- Windows ROCm wheels: the GPU library links a long folder path left out are made after setup (#574).
+- `CMAKE_CUDA_ARCHITECTURES=native` builds for the PC's compute GPUs, not a display card beside them (#56).
+- The GLM engine names the GLM settings set in the environment in one start-up line, with the value used where one
+  is clamped (#6).
+- Docs: running the Maya-XS DeepSeek GGUFs on Intel Arc with llama.cpp's SYCL backend (#401, thanks @Jumbomuffin777).
+- README: speed rows from community reports (#566 #577 #585 #586 #594 #614 #653 #659 #663) and a Sponsors section.
+
 ## v1.1.38 - 2026-10-29
 
 Qwen CYBER-FROST runs faster on PCs with little RAM, a new chat shows the model that answers it, and the web app's

@@ -1078,6 +1078,7 @@ class OutputParser:
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
         self.buf = ""
+        self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
         self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -1089,6 +1090,7 @@ class OutputParser:
         # the answer text that has gone out, followed to tell a call from a quoted one (Strata #1058): the open code
         # fence, the current line, and the backticks of the current paragraph
         self.fence, self.line, self.ticks = "", "", 0
+        self.malformed: list[str] = []   # the bodies of calls that did not parse (#613), for the server's log
         self._reset_scan()
 
     def _track(self, text: str) -> str:
@@ -1370,8 +1372,14 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
+                self._call_resume = 0
             else:
-                i = self.buf.find(CALL_END)
+                # the body accumulates in buf until the call closes, so searching from 0 every
+                # delta is O(body) per token.  In call state buf only grows, and a failed search over
+                # L chars rules out every start position up to L - len(CALL_END): resume there.
+                i = self.buf.find(CALL_END, self._call_resume)
+                if i < 0:
+                    self._call_resume = max(0, len(self.buf) - len(CALL_END) + 1)
                 complete = True
                 if self.stream_tools:
                     if i >= 0:
@@ -1391,7 +1399,24 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                try:
+                    call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                except MalformedToolCall as e:
+                    # a call that does not parse never fails the whole answer (#613: 24K tokens lost to one): one
+                    # already announced goes out as written so far, marked incomplete (as one the output ended
+                    # inside); one that never got that far is the answer's text, as the model wrote it.  `malformed`
+                    # keeps the body for the server's log
+                    self.malformed.append(e.body)
+                    if self.scall is not None:
+                        rest, self.buf = self.buf, body          # (_close_scan reads the body's unscanned rest)
+                        out += self._close_scan()
+                        self.buf = rest
+                        out.append(Event("tool_call", call=self.scall, complete=False))
+                    else:
+                        out.append(Event("content", self._track(CALL_START + body + CALL_END)))
+                    self._reset_scan()
+                    self.state, self.lead = "content", True
+                    continue
                 if self.dsml is not None and "::" in call.name:
                     call.namespace = call.name.split("::", 1)[0]
                 if self.scall is not None:

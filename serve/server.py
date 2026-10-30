@@ -34,6 +34,7 @@ import json
 import math
 import os
 import queue
+import socket
 import re
 import subprocess
 import struct
@@ -55,7 +56,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, models, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
-from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
+from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
                             EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
@@ -74,11 +75,41 @@ try:                        # Project Maya's release (the dashboard's About; the
     MAYA_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip() or None
 except OSError:
     MAYA_VERSION = None
+MAC_FREE_SETTLE_BYTES = 1 << 30    # macOS: the old engine's memory is back once free memory rises by less than this ...
+MAC_FREE_POLL_S = 0.5              # ... between two reads this far apart
+
+
+def mac_free_bytes() -> int | None:
+    """What macOS could give a process now (vm_stat: free, inactive, purgeable and speculative pages), as maya-metal's
+    free_memory() counts it; None when vm_stat can't say."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    size = re.search(r"page size of (\d+) bytes", out)
+    counts = [re.search(rf"^Pages {k}:\s+(\d+)", out, re.M) for k in ("free", "inactive", "purgeable", "speculative")]
+    if not size or not all(counts):
+        return None
+    return sum(int(c.group(1)) for c in counts) * int(size.group(1))
+
+
 def wait_gpu_release(pid: int, timeout: float = 60.0):
     """An engine that has ended still holds its GPU memory for a few seconds - the driver frees tens of GB of VRAM and
     its pinned RAM tier after the process is gone - and an engine started at once finds the cards full (the split
     search measures them before anything loads: the context reload's new engine got 0.09 GB and failed).  Waits until
-    no GPU lists the process any more (NVML), or a few seconds where NVML can't say (AMD)."""
+    no GPU lists the process any more (NVML), or a few seconds where NVML can't say (AMD).  On a Mac no GPU lists it,
+    but its unified memory comes back over seconds too, and maya-metal sizes its expert pool from what is free when it
+    starts (a restart after a crash came back with a smaller pool, partly streaming from the SSD and MTP off): waits
+    until free memory stops rising."""
+    if sys.platform == "darwin":
+        t0, prev = time.time(), mac_free_bytes()
+        while prev is not None and time.time() - t0 < timeout:
+            time.sleep(MAC_FREE_POLL_S)
+            cur = mac_free_bytes()
+            if cur is None or cur - prev < MAC_FREE_SETTLE_BYTES:
+                break
+            prev = cur
+        return
     try:
         from serve.telemetry import gpu_pids
     except ImportError:
@@ -113,20 +144,24 @@ def nvml_pids(pid: int | None, listed: set) -> set:
         return {pid}
 
 
-CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
-CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
-# the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
-# GLM engine's 256K, and maya-mm3's 256K (MiniMax-M3.1 is offered up to its 1M; past 256K it has not been run end to
-# end yet)
-CONTEXT_TESTED = {"ds4": 1048576, "mm3": 262144}
-CONTEXT_TESTED_DEFAULT = 262144
+# the dashboard's Context size range (serve/models.py: the Models page's Engine settings offer the same one)
+CONTEXT_MIN, CONTEXT_FALLBACK_MAX = models.CONTEXT_MIN, models.CONTEXT_FALLBACK_MAX
+CONTEXT_TESTED, CONTEXT_TESTED_DEFAULT = models.CONTEXT_TESTED, models.CONTEXT_TESTED_DEFAULT
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
-REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
+REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm vram|ds4 serve: prompt read|glm prefill: \d|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+TEXT_FILE_MIN, TEXT_FILE_MAX = 512 * 1024, 16 * 1024 * 1024
+
+
+def text_file_limit(context: int) -> int:
+    """The largest text file the chat page attaches (#635): the context holds at most this many bytes of text (about 4
+    bytes a token), at least the 512 KB the page always took and at most 16 MB.  The page sends the file as text, so
+    the real limit is the model's context; the page says so when a file is over it."""
+    return max(TEXT_FILE_MIN, min(TEXT_FILE_MAX, int(context or 0) * 4))
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.  5 s: drafted
 # tokens come in bursts of 1-4 a step, and over 2 s the rate swung +-25% around the engine's steady one
@@ -361,6 +396,20 @@ LOOP_STOP = object()
 LOOP_STOP_NOTE = "(The answer was stopped: the model kept repeating itself.)"
 # a request's max_tokens lowers the thinking budget only at or below this (Service.run)
 THINK_TINY_LIMIT = 1024
+# A reasoning block that reaches the thinking budget is closed at the end of its sentence or line, not mid-sentence
+# (#613: an agent's turn closed in the middle of a formula, and the answer after it was garbled): Service._sliced
+# closes it at the first boundary past the budget, and the engine's own close (its think_budget) only comes this many
+# tokens later, for reasoning with no boundary at all - at most half the room the request's max_tokens leaves after
+# the budget, so the answer keeps the rest.
+THINK_GRACE = 512
+_THINK_BOUNDARY = re.compile(r"(?:\n|(?<![\d.])[.!?][\"')\]]*|[。！？])[ \t]*$")
+
+
+def think_boundary(text: str) -> bool:
+    """The reasoning so far (its last characters will do) ends a line or a sentence: a newline, or . ! ? after
+    something other than a digit or another dot (not "3." of "3.0", not "..."), closing quotes or brackets allowed
+    after it."""
+    return bool(_THINK_BOUNDARY.search(text))
 
 # ---- log-probabilities (OpenAI's `logprobs` / `top_logprobs`; the DeepSeek engine's GEN logprobs=<n> and LP lines).
 # The engine reports, for each token it writes, the token's logprob and its row's n most likely, from the model's
@@ -451,6 +500,19 @@ def logprob_entry(tok, t, n_top: int) -> dict | None:
     e = piece(int(t), lp[0])
     e["top_logprobs"] = [piece(i, v) for i, v in lp[1][:n_top]]
     return e
+
+
+def model_management_setting(cfg: dict | None, env=None) -> bool:
+    """llama.cpp's model management (/models/load, /models/unload, /models/sse, for Open WebUI's Models page): off
+    unless the run config has "model_management": true or MAYA_MODEL_MANAGEMENT says 1 / on / true / yes;
+    the environment, when set, wins over the config."""
+    on = ("1", "on", "true", "yes")
+    env = os.environ if env is None else env
+    v = env.get("STRATA_MODEL_MANAGEMENT", env.get("MAYA_MODEL_MANAGEMENT"))
+    if v is not None and str(v).strip():
+        return str(v).strip().lower() in on
+    v = (cfg or {}).get("model_management")
+    return bool(v) if v is not None else False
 
 
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
@@ -591,8 +653,10 @@ def _quiet_seconds() -> float:
 REQUEST_QUIET_S = _quiet_seconds()
 
 
-# The longest a stopped request's own lines (T / PP / DONE) are waited for when it is drained after a cancel: a STOP
-# an engine does not honour (or a rid it has already let go) would otherwise hold the FIFO place for ever.
+# The longest a stopped request's own lines (T / PP / DONE) are waited for when it is drained after a cancel with
+# --parallel: a STOP an engine does not honour (or a rid it has already let go) would otherwise hold the FIFO place for
+# ever.  With one conversation the drain waits for the DONE (its lines share one queue with the next request's) and
+# this is only when it says it is still waiting; a stuck engine there is ended by the stall watchdog (ENGINE_STALL_S).
 def _drain_seconds() -> float:
     try:
         return max(1.0, float(os.environ.get("STRATA_DRAIN_S", "60")))
@@ -613,10 +677,11 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int], window_s: flo
 
 
 # MAYA_DS4_RESTORE_POINTS (4): the DeepSeek engine keeps restore points where a later prompt is likely to leave this
-# one - its GEN line carries marks=<pos>,... and shared=<pos> - besides the end of the last prompt, the position before
-# it and the anchor it keeps anyway.  N (1-16) turns them on, and is also the engine's cap a conversation (it reads the
-# same setting); 0: no keys, every GEN line as before.  MAYA_DS4_RESTORE_TAIL (512): how far before the
-# prompt's end the tail point sits (0: none).
+# one - its GEN line carries marks=<pos>,..., tail=<pos> and shared=<pos> - besides the end of the last prompt, the
+# position before it and the anchor it keeps anyway.  N (1-16) turns them on, and is also the engine's cap a
+# conversation (it reads the same setting); 0: no keys, every GEN line as before.  MAYA_DS4_RESTORE_TAIL (512): how far
+# before the prompt's end the tail point sits (0: none); it goes as tail=, not in marks=, because the engine leaves it
+# out where its read stop costs more than reading those tokens again (most experts outside VRAM, #668).
 RESTORE_LEAST = 1024        # no point before this many tokens: such a start is read again in about the time a point costs
 
 
@@ -633,14 +698,14 @@ def restore_point_settings(env=None) -> tuple[bool, int]:
 
 
 def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTORE_LEAST) -> dict:
-    """Where the DeepSeek engine keeps restore points for this prompt -> {"marks": [pos, ...], "shared": pos} (either
-    may be missing; {}: none).  From the prompt's ids as the template wrote them: a turn opens with its role's special
+    """Where the DeepSeek engine keeps restore points for this prompt -> {"marks": [pos, ...], "tail": pos, "shared":
+    pos} (any may be missing; {}: none).  From the prompt's ids as the template wrote them: a turn opens with its role's special
     token (<｜User｜>, a tool result's turn too; <｜System｜> for a system message after the first user turn), and text
     inside a message never encodes to one (render_ids), so the positions are the template's own.
 
     - the start of the last user turn: its last message edited, or sent again after another answer, goes back there;
-    - `tail` tokens before the end, when the last turn is longer than that: a new question after the same long document
-      in the same message;
+    - "tail": `tail` tokens before the end, when the last turn is longer than that: a new question after the same long
+      document in the same message (the engine keeps it where its read stop costs less than reading those tokens);
     - "shared": the end of the system prompt and its tools (the first user turn): another conversation behind the same
       start goes back there, and the engine gives that point up last.
     Positions under `least` are left out: a start that short is read again in about the time a point costs."""
@@ -660,7 +725,7 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
         marks.append(last)
     t = len(ids) - tail
     if tail > 0 and t >= least and (last is None or t > last):
-        marks.append(t)
+        out["tail"] = t
     if marks:
         out["marks"] = sorted(marks)
     return out
@@ -1128,16 +1193,19 @@ class StrataEngine:
 
     @staticmethod
     def restore_keys(sampling: dict) -> str:
-        """`marks=<pos>,...` and `shared=<pos>`: the DeepSeek engine's restore points for this prompt (Service.run puts
-        them in `_restore` with MAYA_DS4_RESTORE_POINTS; no other engine gets them).  "" without: the line as before."""
+        """`marks=<pos>,...`, `tail=<pos>` and `shared=<pos>`: the DeepSeek engine's restore points for this prompt
+        (Service.run puts them in `_restore` with MAYA_DS4_RESTORE_POINTS; no other engine gets them).  "" without: the
+        line as before."""
         pts = sampling.get("_restore")
         if not isinstance(pts, dict):
             return ""
-        marks = [p for p in pts.get("marks") or () if isinstance(p, int) and not isinstance(p, bool) and p > 0]
-        shared = pts.get("shared")
+
+        def pos(v):
+            return isinstance(v, int) and not isinstance(v, bool) and v > 0
+        marks = [p for p in pts.get("marks") or () if pos(p)]
+        tail, shared = pts.get("tail"), pts.get("shared")
         return ((" marks=" + ",".join(str(p) for p in marks) if marks else "") +
-                (f" shared={shared}" if isinstance(shared, int) and not isinstance(shared, bool) and shared > 0
-                 else ""))
+                (f" tail={tail}" if pos(tail) else "") + (f" shared={shared}" if pos(shared) else ""))
 
     @staticmethod
     def logprob_key(sampling: dict) -> str:
@@ -1246,24 +1314,46 @@ class StrataEngine:
                         self.proc.stdin.flush()
                     except OSError:
                         pass
-                # Bounded like the multi one (see DRAIN_S): a STOP the engine does not honour must not hold the
-                # request's place in the FIFO for ever.
-                end = time.monotonic() + DRAIN_S
+                # Not bounded like the multi one: one conversation shares one line queue, so going on before this
+                # request's DONE handed its lines (T ... DONE) to the next request, and every request after it read
+                # the one before's answer (a request cancelled 70 s into a long prompt: the engine looks
+                # at STOP between the prompt's chunks, and a 32K chunk deep in a long context takes over a minute).
+                # The engine is busy with it either way, so the drain waits; only a stuck engine (the stall watchdog,
+                # STRATA_ENGINE_STALL_S) ends it.  DRAIN_S is when it says so.
+                t0 = heard = time.monotonic()
+                said, stall = False, {}
                 while True:
                     try:
-                        line = self.lines.get(timeout=max(0.05, end - time.monotonic()))
+                        line, quiet = self.lines.get(timeout=5), False
                     except queue.Empty:
-                        print(f"[maya] stopped, and the engine did not say the request had ended within {DRAIN_S:.0f} s "
-                              "(STRATA_DRAIN_S) - going on; the engine may still be writing it", flush=True)
-                        break
+                        line, quiet = None, True
+                    # (looked at on every line too: a prompt's progress lines go on while its chunk is read)
+                    if not said and time.monotonic() - t0 >= DRAIN_S:
+                        said = True
+                        print(f"[maya] stopped, and the engine has not said the request ended after {DRAIN_S:.0f} s "
+                              "(STRATA_DRAIN_S) - it is still working on it (a long prompt is stopped between its "
+                              "chunks); waiting for it", flush=True)
+                    if quiet:
+                        why = self._stall_check(heard, stall) if ENGINE_STALL_S > 0 else None
+                        if why:
+                            self._end(why)
+                            break
+                        continue
+                    heard = time.monotonic()
+                    stall.clear()
                     if line is None:
                         self.lines.put(None)                # (the engine is gone: the next reader hears it too)
                         break
+                    if line.startswith("STAT "):
+                        self._parse_stat(line)   # the final snapshot can follow EOS or the consumer's last token
+                        continue
                     if line.startswith("ERR"):
                         self._done_after_err()
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)
+                        if said:
+                            print(f"[maya] the stopped request ended after {heard - t0:.0f} s", flush=True)
                         break
 
     # How long, after an ERR, the reader waits for the DONE that may follow it: maya-ds4 and maya-mm3 print one right
@@ -1777,37 +1867,8 @@ def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple
     return None
 
 
-def trained_context(model_dir) -> int | None:
-    """The context the model was trained for (`<arch>.context_length` in its first GGUF's header; GLM-5.3-Flash:
-    1,048,576): the top of the dashboard's Context size.  None when there is no readable GGUF."""
-    try:
-        sys.path.insert(0, str(ROOT / "tools"))
-        from gguf_reader import GGUFFile
-        shards = sorted(Path(model_dir).glob("*-00001-of-*.gguf")) or sorted(Path(model_dir).glob("*.gguf"))
-        if not shards:
-            return None
-        md = GGUFFile(shards[0]).metadata
-        n = md.get(f"{md.get('general.architecture', '')}.context_length")
-        return int(n) if isinstance(n, int) and n > 0 else None
-    except Exception:  # noqa: BLE001 - a header it can't read: the fallback range
-        return None
-
-
-def trained_context_ds4(pack) -> int | None:
-    """DeepSeek's and MiniMax's: the context its pack says the model was trained for (ds4.txt's / mm3.txt's
-    max_position_embeddings, from the model's config.json or a GGUF's context_length; V4.1-Flash and M3.1-Flash:
-    1,048,576, their native reach), the top of the dashboard's Context size.  None when the pack does not say."""
-    for name in ("ds4.txt", "mm3.txt"):
-        try:
-            with open(Path(pack) / name, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    k, _, v = line.strip().partition(" ")
-                    if k == "max_position_embeddings":
-                        n = int(v.split()[0])
-                        return n if n > 0 else None
-        except (OSError, ValueError, IndexError):
-            continue
-    return None
+trained_context = models.trained_context            # (the context a model was trained for: serve/models.py)
+trained_context_ds4 = models.trained_context_ds4
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -1835,11 +1896,13 @@ def child_env(cfg: dict) -> dict:
     env = dict(os.environ)
     if gpu_list(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (setup's KFD order)
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
-    elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
+    elif gpu_list(cfg) and cfg.get("backend") != "metal":   # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+        if cfg.get("backend") == "metal":            # maya-metal reads its settings by their MAYA_* names
+            env[maya_names.shown(str(k))] = str(v)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -1963,7 +2026,8 @@ class Service:
         # the loop guard (serve/loop_guard.py; MAYA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
         # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
         self.loop_guard = True
-        self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0}
+        self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0, "tool_repeats": 0,
+                                  "tool_blocked": 0, "collapsed": 0, "kept_going": 0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -2171,7 +2235,7 @@ class Service:
     def context_limits(self) -> dict:
         """The dashboard's Context size: the range it offers and the engine's measured cost of the current one."""
         info = dict(getattr(self.engine, "info", {}) or {})
-        top = self.trained_context or CONTEXT_FALLBACK_MAX
+        rng = models.context_range(self.trained_context, self.engine.max_context, str(info.get("engine_kind") or ""))
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         # a streamed cache's RAM (KV streaming: maya-mm3's VRAM lines' kv_ram - every position's K / V in pinned RAM,
@@ -2185,9 +2249,7 @@ class Service:
                 ram = {"ram_gb": round(vm.total / 2**30, 1), "ram_free_gb": round(vm.available / 2**30, 1)}
             except Exception:  # noqa: BLE001 - psutil is optional: no RAM figures, no RAM warning
                 pass
-        return {"context": self.engine.max_context, "min": CONTEXT_MIN, "max": max(top, self.engine.max_context),
-                "trained": self.trained_context,
-                "tested": CONTEXT_TESTED.get(str(info.get("engine_kind") or ""), CONTEXT_TESTED_DEFAULT),
+        return {"context": self.engine.max_context, **rng,
                 "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
                 "kv_resident": info.get("kv_resident") or 0,
                 "kv_ram_gb": round(kv_ram / 2**30, 3) if kv_ram else None, **ram,
@@ -2598,12 +2660,24 @@ class Service:
         return any(isinstance(u, (int, float)) and u > STALL_GPU_BUSY for u in utils)
 
     def _tok_s(self):
-        """tok/s over the last RATE_WINDOW_S seconds, summed over the requests decoding now.  0.0 while none is."""
+        """tok/s over the last RATE_WINDOW_S seconds, summed over the requests decoding now.  0.0 while none is.
+        Every reading is also the Monitor's live Decode figure, so one above the peak decode becomes the peak."""
         with self.status_lock:
             if not self.status.get("busy"):
                 return 0.0
             now = time.time()
-            return sum(r.tok_s(now) for r in self.current_requests)
+            rate = sum(r.tok_s(now) for r in self.current_requests)
+            n = sum((r.samples[-1] if r.samples else r.base or (0, 0))[1] for r in self.current_requests)
+            self._note_peak(rate, n, now)
+            return rate
+
+    def _note_peak(self, tok_s, tokens, when):
+        """The Monitor's peak decode (status_lock held): the highest decode rate it has shown - a running answer's live
+        rate or a finished answer's - rounded as shown (0.1 tok/s), once the answers hold PEAK_MIN_TOKENS tokens."""
+        tok_s = round(tok_s or 0.0, 1)
+        peak = self.totals.get("peak_decode")
+        if tok_s > 0 and tokens >= PEAK_MIN_TOKENS and (peak is None or tok_s > peak["tok_s"]):
+            self.totals["peak_decode"] = {"tok_s": tok_s, "tokens": tokens, "time": when}
 
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
@@ -2623,6 +2697,7 @@ class Service:
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
+        rate = self._tok_s()                            # (first: a live rate above the peak is the peak in `totals`)
         with self.status_lock:
             s = dict(self.status)
             answering = self.latest_request in self.current_requests
@@ -2646,7 +2721,7 @@ class Service:
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
                 "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
-                "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                "tok_s": round(rate, 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
@@ -2695,6 +2770,9 @@ class Service:
 
     # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
     PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",
+                 "draft_rounds": "DSpark draft calls in the current decode interval (all requests with parallel serving)",
+                 "draft_ms": "DSpark drafter measured host time in the current decode interval, ms",
+                 "verify_ms": "DSpark verification forward measured host time in the current decode interval, ms",
                  "vram_hit": "Share of the routed experts found in VRAM (0..1)",
                  "ram_fetch": "Experts a token read from the RAM tier",
                  "disk": "Experts a token read from the SSD",
@@ -2752,6 +2830,16 @@ class Service:
              guard["thinking_closed"]),
             ("maya:loop_guard_stopped_total", "counter", "Answers the loop guard ended (a loop that came back)",
              guard["stopped"]),
+            ("maya:loop_guard_tool_repeats_total", "counter",
+             "Tool calls made again and again with the same result that got a note after them", guard["tool_repeats"]),
+            ("maya:loop_guard_tool_blocked_total", "counter",
+             "Tool calls the loop guard did not let out (made again after its notes)", guard["tool_blocked"]),
+            ("maya:loop_guard_kept_going_total", "counter",
+             "Answers that would have ended the turn with nothing in a conversation that repeats itself, kept going",
+             guard["kept_going"]),
+            ("maya:loop_guard_collapsed_total", "counter",
+             "Prompts the loop guard left the model's repeats out of (a conversation that repeats itself)",
+             guard["collapsed"]),
         ]
         rows += [(f"maya:engine_{k}", "counter" if k in self.PROM_STAT_COUNTERS else "gauge", h, stat[k])
                  for k, h in self.PROM_STAT.items()
@@ -2816,10 +2904,24 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None, guard=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
-        starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
+        starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run().
+        With the loop guard (`guard`, else the server's) a tool call the model keeps making with the same result gets
+        a note after that result (_tool_repeat); one it made again after TOOL_NUDGES such notes is blocked in this
+        answer (kwargs["_blocked"] for run(), _block_suffixes); and in a conversation that repeats itself an answer
+        may not end the turn short (kwargs["_blocked"]["_keep"], _keep_suffix)."""
+        on = self.loop_guard if guard is None else guard
+        blocked = loop_guard.tool_blocked(messages) if on else {}
+        looping = bool(blocked) or bool(on and loop_guard.echoes(messages))
+        asked = messages                            # (the request's own, before the prompt leaves anything out)
+        if on:
+            noted = self._tool_repeat(messages)
+            if blocked and len(noted) == len(messages) and messages and messages[-1].get("role") == "user" \
+                    and loop_guard.go_on(messages[-1]):     # "continue": which calls stay blocked, said at once
+                noted = messages + [{"role": "user", "content": loop_guard.blocked_note(blocked)}]
+            messages = self._collapse(messages) + noted[len(messages):]
         given, force = kwargs, kwargs.get("_force_tool")
         kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
         if force is not None and tools:
@@ -2838,6 +2940,11 @@ class Service:
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
+        given["_blocked"] = self._block_suffixes(blocked, tools, kwargs) if blocked and force is None else None
+        if looping and tools and force is None:
+            keep = self._keep_suffix(tools, kwargs)
+            if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
+                given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
         media = media_of(messages)
@@ -2932,6 +3039,8 @@ class Service:
                 for _, (path, _) in enc:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
+        if self.engine.max_context <= 0:   # (a reload / /models/load: the start has not reported its context yet)
+            raise BadBody(503, "the model is starting; try again in a moment")
         room = self.engine.max_context - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
@@ -2975,6 +3084,15 @@ class Service:
         media = media_of(messages)
         return {"tokens": len(self.render_ids(messages, tools, kw)), "images": len(media),
                 "approximate": bool(media), "max_context": self.engine.max_context}
+
+    @staticmethod
+    def _say_malformed(parser):
+        """A tool call the parser could not read (it went out as text, or as an incomplete call: OutputParser): the
+        whole body in the server window (#613)."""
+        while parser.malformed:
+            body = parser.malformed.pop(0)
+            print(f"[maya] a malformed tool call, sent on as written instead of failing the answer "
+                  f"({len(body)} characters): {body!r}", flush=True)
 
     def _note(self, n, evs, stat):
         with self.status_lock:
@@ -3075,6 +3193,7 @@ class Service:
         if (sampling or {}).get("_think_end") in produced:
             smp.pop("_think_budget", None)
             smp.pop("_think_end", None)
+            smp.pop("_think_soft", None)
         else:
             smp["_think_budget"] = max(1, tb - len(produced))
         return smp
@@ -3089,6 +3208,93 @@ class Service:
         whole), and a tokenizer without bytes decodes the token alone (no decode of the whole answer a token)."""
         d = Detokenizer(self.tok)
         return d.push if d.inc is not None else (lambda t: self.tok.decode([t]))
+
+    def _block_suffixes(self, blocked, tools, kwargs):
+        """{(name, args): (ToolRepeat, ids, thinks)}: for each blocked call (loop_guard.tool_blocked) the prompt that
+        follows the model's own `</tool_call>` when the server answers it itself - the template's call close, the tool
+        result loop_guard.block_result, a user message loop_guard.block_note and the next assistant turn's opening
+        (`thinks`: that opening is an open thinking block, which run() starts with loop_guard.block_steer).  None for
+        a template that does not end a call with </tool_call> or does not render a turn as a prefix of the next."""
+        out = {}
+        for key, rep in blocked.items():
+            call = {"id": "call_loop_guard", "type": "function",
+                    "function": {"name": key[0], "arguments": json.loads(key[1])}}
+            head = [{"role": "user", "content": "."}, {"role": "assistant", "content": "", "tool_calls": [call]}]
+            tail = [{"role": "tool", "tool_call_id": "call_loop_guard", "content": loop_guard.block_result(rep)},
+                    {"role": "user", "content": loop_guard.block_note(rep)}]
+            try:
+                p = self.template.render(head, tools=tools, **{**kwargs, "add_generation_prompt": False})
+                f = self.template.render(head + tail, tools=tools, **kwargs)
+            except Exception as e:                  # (a template that wants more than this: notes only)
+                print(f"[maya] loop guard: cannot block `{rep.name}` with this template ({e})", flush=True)
+                return None
+            if kwargs.get("enable_thinking") is False and f.endswith("<think>"):
+                f += "</think>"                     # (as render_ids)
+            if not f.startswith(p) or CALL_END not in p:
+                return None
+            out[key] = (rep, self.tok.encode(p[p.rindex(CALL_END) + len(CALL_END):] + f[len(p):], parse_special=True),
+                        f.rstrip().endswith("<think>"))
+        return out
+
+    def _keep_suffix(self, tools, kwargs):
+        """(ids, thinks): the prompt that follows the model's own last words when it would end its turn short in a
+        conversation that repeats itself (loop_guard.stops_short) - the template's turn end, a user message
+        loop_guard.KEEP_NOTE and the next assistant turn's opening (`thinks`: an open thinking block).  None for a
+        template that does not render a turn as a prefix of the next."""
+        mark = "\u2063keep\u2063"                  # (the model's words, wherever the template puts them)
+        head = [{"role": "user", "content": "."}, {"role": "assistant", "content": mark}]
+        try:
+            p = self.template.render(head, tools=tools, **{**kwargs, "add_generation_prompt": False})
+            f = self.template.render(head + [{"role": "user", "content": loop_guard.KEEP_NOTE}], tools=tools, **kwargs)
+        except Exception:
+            return None
+        if kwargs.get("enable_thinking") is False and f.endswith("<think>"):
+            f += "</think>"
+        if not f.startswith(p) or mark not in p:
+            return None
+        return (self.tok.encode(p[p.rindex(mark) + len(mark):] + f[len(p):], parse_special=True),
+                f.rstrip().endswith("<think>"))
+
+    def _collapse(self, messages):
+        """A conversation that carries a loop across turns (loop_guard.collapse): its prompt without what the model
+        already wrote - only that prompt changes."""
+        c = loop_guard.collapse(messages)
+        if c is None:
+            return messages
+        print(f"[maya] loop guard: the conversation repeats itself - left out of the prompt: {c.paragraphs} pieces "
+              f"of the model's own text it had written before, {c.rounds} tool rounds that repeat earlier ones",
+              flush=True)
+        with self.status_lock:
+            self.loop_guard_counts["collapsed"] += 1
+        return c.messages
+
+    def _kept_going(self, kept, text):
+        print(f"[maya] loop guard: the model would end its turn with nothing ({' '.join(text.split())[:80]!r}): "
+              f"kept going ({kept}. time in this answer)", flush=True)
+        with self.status_lock:
+            self.loop_guard_counts["kept_going"] += 1
+
+    def _tool_blocked(self, rep, tries):
+        print(f"[maya] loop guard: `{rep.name}` again after {loop_guard.TOOL_NUDGES} notes ({rep.times} runs, the same "
+              f"result): blocked ({tries}. time in this answer), not run - a note, the thinking steered away and on",
+              flush=True)
+        with self.status_lock:
+            self.loop_guard_counts["tool_blocked"] += 1
+
+    def _tool_repeat(self, messages):
+        """The loop guard across turns (loop_guard.tool_repeat): the request's last tool call, made again and again
+        with the same arguments and the same result - a user message with loop_guard.tool_note() follows its result
+        (inside the result GLM-5.3 ran the call again; as a message of its own it moved on).  Only this prompt changes:
+        the client's conversation stays as it sent it (its next request matches the kept one up to that result, so
+        only the tail is read again)."""
+        rep = loop_guard.tool_repeat(messages)
+        if rep is None:
+            return messages
+        print(f"[maya] loop guard: `{rep.name}` {rep.times} times with the same arguments and result: a note after it",
+              flush=True)
+        with self.status_lock:
+            self.loop_guard_counts["tool_repeats"] += 1
+        return messages + [{"role": "user", "content": loop_guard.tool_note(rep)}]
 
     def _loop_noted(self, act, written: int):
         """A loop the guard broke: a line in the server window, and the Monitor's count."""
@@ -3119,13 +3325,19 @@ class Service:
         produced, cur, left, smp = [], list(ids), max_new, sampling
         segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
+        # the thinking budget closed at a sentence's or line's end (THINK_GRACE, #613): past `soft` tokens of
+        # reasoning, the first token that ends one is followed by the end of the thinking - this call stops there and
+        # the next goes on with it (the engine's own close, its think_budget, comes later, for reasoning with none)
+        soft, think_end = (sampling or {}).get("_think_soft"), (sampling or {}).get("_think_end")
+        soft_text = self._guard_piece() if isinstance(soft, int) and isinstance(think_end, int) else None
+        tail_text = ""
         while True:
             last0 = getattr(self.engine, "last", None)
             smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
             gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, n_call, smp_call, cancel)
             slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
-            act, got = None, 0                          # the loop guard's action; this call's tokens
+            act, got, closed = None, 0, False           # the loop guard's action; this call's tokens; a soft close
             try:
                 for t in gen:
                     if guard is None:
@@ -3135,14 +3347,23 @@ class Service:
                     if t is None:
                         continue
                     produced.append(t)
+                    if soft_text is not None:
+                        if t == think_end:
+                            soft_text = None            # (closed: by the model, or the engine's budget)
+                        else:
+                            tail_text = (tail_text + (soft_text(t) or ""))[-16:]
+                            if len(produced) >= soft and think_boundary(tail_text) and len(produced) < max_new - 1:
+                                closed = True
                     if guard is not None:
                         got += 1
-                        act = guard.push(t, len(produced))
+                        act = guard.push(t, len(produced)) if not closed else None
                         if act is not None:
                             break                       # (gen.close(): STOP + drain, still holding the FIFO)
-                        while sent < len(produced) - guard.hold:
+                        while sent < len(produced) - (guard.hold if not closed else 0):
                             sent += 1
                             yield produced[sent - 1]
+                    if closed:
+                        break                           # (gen.close(): STOP + drain, still holding the FIFO)
                     if t0 is None:
                         t0 = time.monotonic()
                     if slice_s > 0 and not pausing and not emb and not self.stopping and len(produced) < max_new \
@@ -3163,6 +3384,20 @@ class Service:
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
+            if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
+                produced.append(think_end)
+                sent = len(produced)
+                soft_text = None
+                yield think_end
+                if guard is not None:
+                    guard.thinking_closed(produced)
+                print(f"[maya] thinking reached its budget ({soft} tokens): closed at the end of a sentence or line, "
+                      f"{len(produced) - 1 - soft} tokens later; answering", flush=True)
+                if cancel.is_set() or self.stopping:
+                    break
+                cur, left = list(ids) + produced, max_new - len(produced)
+                smp = self._resumed_sampling(sampling, produced)
+                continue
             if act is not None:                         # a loop: what is kept, then on from there - or the end
                 del produced[max(sent, len(produced) - act.drop):]   # (what was sent stays sent: only the held tail goes)
                 if act.kind == loop_guard.CLOSE_THINKING:
@@ -3244,10 +3479,23 @@ class Service:
             sampling = {**defaults, **req_values}
         responses = (sampling or {}).get("_responses") is True
         single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
-                              dsml=getattr(self.template, "deepseek", False),
-                              minimax=getattr(self.template, "minimax", False),
-                              strict_tools=responses, single_tool=single_tool)
+        def new_parser():
+            return OutputParser(thinking=thinking, tools=tools, stream_tools=True,
+                                dsml=getattr(self.template, "deepseek", False),
+                                minimax=getattr(self.template, "minimax", False),
+                                strict_tools=responses, single_tool=single_tool)
+        parser = new_parser()
+        # calls the loop guard blocks in this answer (prepare, _block_suffixes): {(name, args): (ToolRepeat, ids)}.
+        # While there are any, the answer's calls are held back (`pending`) until it ends; one that ends it alone
+        # with a blocked call never goes out - the server answers it in the prompt and the model goes on, as often as
+        # it takes (only max_tokens ends it, as any answer)
+        blocked = dict((sampling or {}).get("_blocked") or {})
+        keep = blocked.pop("_keep", None)           # (ids, thinks, seen): the answer may not end the turn short
+        said = []                                   # this engine call's text for the user (stops_short)
+        kept = 0                                    # times it was kept going in this answer
+        called = False                              # it wrote a tool call (then its turn does not end here)
+        pending, tries, sent_call = [], {}, False
+        seg = {"prompt": ids, "ids": [], "next": None}   # this engine call's prompt and tokens; the next one's
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
@@ -3332,12 +3580,22 @@ class Service:
                 # max_tokens=4096 used to cut the thinking to ~3K tokens and close it while the model was still
                 # reasoning. The forced </think> also consumes one token of max_new, so account for it.
                 think_budget = self.think_budget
+                soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
                 if in_think and max_new and int(max_new) <= THINK_TINY_LIMIT:
                     reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
                     reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
                     think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
+                elif in_think:
+                    # the engine's own close THINK_GRACE tokens later (at most half the room max_tokens leaves after
+                    # the budget); the reasoning ends at its first sentence or line end past the budget (#613)
+                    room = (int(max_new) - think_budget - 1) // 2 if max_new else THINK_GRACE
+                    grace = max(0, min(THINK_GRACE, room))
+                    if grace > 0:
+                        soft, think_budget = think_budget, think_budget + grace
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
+                    if soft is not None:
+                        sampling["_think_soft"] = soft
                 # MAYA_DS4_RESTORE_POINTS: where the DeepSeek engine keeps restore points for this prompt (never a
                 # client's own `_restore`; not with pictures, whose spans the engine reads whole)
                 if sampling and "_restore" in sampling:
@@ -3348,7 +3606,7 @@ class Service:
                     if pts:
                         sampling = {**(sampling or {}), "_restore": pts}
 
-                def attempts():
+                def attempts(prompt, left):
                     """The engine's tokens.  When its numbers went non-finite (a NaN or an infinity in a route: the
                     engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
                     state and the request runs once more, its prompt read from token 0."""
@@ -3357,7 +3615,7 @@ class Service:
                                                          piece=self._guard_piece()) \
                             if guard_on else None       # (serve/loop_guard.py; a fresh one for a run again; leaves tool calls alone)
                         guards[:] = [guard] if guard is not None else []
-                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold, stat, guard), 0
+                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, guard), 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -3370,9 +3628,34 @@ class Service:
                                   "running the request again from token 0", flush=True)
                         finally:
                             sliced.close()
+                def segments():
+                    """attempts(), and after a blocked call (seg["next"]) the engine again on that prompt."""
+                    while True:
+                        yield from attempts(seg["prompt"], max(1, max_new - n))
+                        if seg["next"] is None or cancel.is_set() or self.stopping:
+                            return
+                        seg["prompt"], seg["next"], seg["ids"] = seg["next"], None, []
+
+                def flush():
+                    nonlocal sent_call, answered
+                    for ev in pending:
+                        sent_call = sent_call or ev.kind == "tool_call"
+                        answered = answered or ev.kind != "reasoning"
+                        yield "event", ev
+                    pending.clear()
+
+                def blocked_call():
+                    """The key of the blocked call that alone ends what this engine call wrote, else None."""
+                    calls = [ev for ev in pending if ev.kind == "tool_call"]
+                    if sent_call or len(calls) != 1 or not calls[0].complete or \
+                            any(ev.kind == "content" and ev.text.strip() for ev in pending):
+                        return None
+                    key = (calls[0].call.name, loop_guard.args_key(calls[0].call.arguments))
+                    return key if key in blocked else None
+
                 guard_on = self._loop_guard_on(sampling)
-                gen = attempts()
-                said = bool(pre_events)                 # any answer (text or a call) went out yet
+                gen = segments()
+                answered = bool(pre_events)             # any answer (text or a call) went out yet
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
                 try:
@@ -3387,10 +3670,10 @@ class Service:
                             finish = "stop"
                             if held:
                                 for ev in parser.feed(held):
-                                    said = said or ev.kind != "reasoning"
+                                    answered = answered or ev.kind != "reasoning"
                                     yield "event", ev
                                 held = ""
-                            if not said:                # (a model with no end-of-thinking token, still thinking)
+                            if not answered:             # (a model with no end-of-thinking token, still thinking)
                                 yield "event", Event("content", LOOP_STOP_NOTE)
                             break
                         n += 1
@@ -3399,12 +3682,44 @@ class Service:
                         if in_think and t == self.think_end_id:
                             in_think = False
                             if n == think_budget + 1:
-                                print(f"[maya] thinking reached its budget ({think_budget} tokens): closed, "
-                                      "answering", flush=True)
+                                print(f"[maya] thinking reached its budget ({think_budget} tokens"
+                                      f"{f', {soft} + {think_budget - soft} without a sentence end' if soft else ''})"
+                                      ": closed, answering", flush=True)
                         if t in self.stop_ids:
                             finish = "stop"
                             raw_ids.append(t)
-                            break
+                            key = blocked_call() if blocked else None
+                            if key is None and keep is not None and not called and \
+                                    (kept < loop_guard.KEEP_MIN or loop_guard.stops_short("".join(said), keep[2])):
+                                # it would end the turn in a conversation that repeats itself: the first KEEP_MIN
+                                # times, and whenever with nothing new (talk about its loop, a line, what it said
+                                # before), it goes on
+                                kept += 1
+                                self._kept_going(kept, "".join(said))
+                                ids_k, thinks, _ = keep
+                                steer = self.tok.encode(loop_guard.keep_steer(kept)) if thinks else []
+                                seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
+                                sampling = loop_guard.block_sampling(sampling, kept)
+                                parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
+                                in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
+                                continue
+                            if key is None:
+                                break
+                            rep, suffix, thinks = blocked[key]
+                            pending.clear()             # the call never goes out
+                            called = False
+                            tries[key] = tries.get(key, 0) + 1
+                            self._tool_blocked(rep, tries[key])
+                            # the server answers it: the call's result and a note in the prompt, and the model's next
+                            # thinking starts a step away from it (never the end: it goes on until it does something
+                            # else; from the 2nd time a little hotter)
+                            steer = self.tok.encode(loop_guard.block_steer(rep, key[1], tries[key])) if thinks else []
+                            seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix + steer
+                            sampling = loop_guard.block_sampling(sampling, tries[key])
+                            parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
+                            in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
+                            continue
+                        seg["ids"].append(t)
                         if parser.state == "reasoning":
                             reasoning_tokens += 1
                         raw_ids.append(t)
@@ -3429,17 +3744,26 @@ class Service:
                                 text, held = held[:len(held) - k], held[len(held) - k:]
                         was = parser.state
                         evs = with_lp(parser.feed(text), was)
+                        self._say_malformed(parser)
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)
                         for ev in evs:
-                            said = said or ev.kind != "reasoning"
-                            yield "event", ev
+                            if ev.kind == "content":
+                                said.append(ev.text)
+                            elif ev.kind == "tool_call":
+                                called = True
+                            if blocked and (pending or ev.kind.startswith("tool")):
+                                pending.append(ev)      # (a call: held back until the answer ends)
+                            else:
+                                answered = answered or ev.kind != "reasoning"
+                                yield "event", ev
                             if single_tool and ev.kind == "tool_call" and ev.complete:
                                 stopped = True
                                 break
                         if stopped:
                             finish = "stop"
                             break
+                    yield from flush()
                     if held:                    # the run ended on what only looked like a marker's start
                         was = parser.state
                         for ev in with_lp(parser.feed(held), was):
@@ -3461,6 +3785,7 @@ class Service:
                         finish = "length"
                         print(f"[maya] the engine's numbers went non-finite after {n} tokens ({e}): the answer ends "
                               "there", flush=True)
+                        yield from flush()
                         if held:
                             was = parser.state
                             for ev in with_lp(parser.feed(held), was):
@@ -3508,10 +3833,7 @@ class Service:
                         "loop_guard": guards[0].summary() if guards and guards[0].events else None}
                     self.history.append(row)
                     t = self.totals
-                    peak = t.get("peak_decode")
-                    if row["decode_tok_s"] and n >= PEAK_MIN_TOKENS and \
-                            (peak is None or row["decode_tok_s"] > peak["tok_s"]):
-                        t["peak_decode"] = {"tok_s": row["decode_tok_s"], "tokens": n, "time": started}
+                    self._note_peak(row["decode_tok_s"], n, started)
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
                     t["reused"] += last.get("reused") or 0
@@ -3547,6 +3869,7 @@ class Service:
         was = parser.state
         for ev in with_lp(parser.finish(), was):
             yield "event", ev
+        self._say_malformed(parser)
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
@@ -3685,9 +4008,10 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                                         for c in calls]})
         messages += [{"role": "tool", "tool_call_id": c.id, "content": r} for c, r in zip(calls, results)]
         # a required tool call applies to the first answer only: after the tools ran, the model answers freely
-        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill")}
+        kw = {k: v for k, v in kw.items() if k not in ("_force_tool", "_prefill", "_blocked")}
         sampling = {k: v for k, v in (sampling or {}).items() if k != "_prefill"}
-        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
+        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, guard=svc._loop_guard_on(sampling))
+        sampling["_blocked"] = kw.get("_blocked")
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -4059,6 +4383,17 @@ def _backlog() -> int:
         return 256
 
 
+def request_timeout() -> float:
+    """Seconds one socket read or write may wait (a client that sends half a request and nothing more must not hold a
+    thread for ever): 300 by default, STRATA_REQUEST_TIMEOUT_S changes it.  Per operation: a long answer that writes
+    nothing while it thinks is not cut."""
+    try:
+        s = float(os.environ.get("STRATA_REQUEST_TIMEOUT_S", "0"))
+    except ValueError:
+        s = 0.0
+    return s if s > 0 else 300.0
+
+
 def body_limit() -> int:
     """The most a request body may hold, in bytes (it is read into memory): 256 MiB, a million-token conversation with
     room to spare; STRATA_MAX_BODY_MIB changes it.  A larger one is answered 413 before it is read (Strata #893)."""
@@ -4101,6 +4436,7 @@ def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
         answer_started = False                              # a malformed request's 400 only replaces an answer not begun
+        timeout = request_timeout()
 
         def log_message(self, fmt, *args):
             pass
@@ -4157,6 +4493,68 @@ def make_handler(svc: Service):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _llamacpp_model(self, op: str):
+            """llama.cpp's /models/load and /models/unload: Open WebUI's Models page (load / switch)."""
+            if not getattr(svc, "model_management", False):
+                self._json(404, {"error": {"message": "model management is off (\"model_management\": true, or "
+                                                      "MAYA_MODEL_MANAGEMENT=1, turns it on)"}})
+                return
+            try:
+                body = json.loads(self._body().decode() or "{}")
+            except Exception:  # noqa: BLE001 - no body: the running model
+                body = {}
+            name = (body or {}).get("model") or svc.model
+            if name != svc.model:
+                self._json(404, {"error": {"message": "model not found"}})
+                return
+            if op == "unload":
+                state = svc.unload()
+                if state == "busy":
+                    self._json(409, {"error": {"message": "a request is running or waiting; unload when idle"}})
+                elif state == "unsupported":
+                    self._json(400, {"error": {"message": "this engine cannot unload"}})
+                else:
+                    self._json(200, {"model": name, "status": {"value": "unloaded"}})
+                return
+            if hasattr(svc.engine, "alive") and svc.engine.alive():
+                self._json(200, {"model": name, "status": {"value": "loaded"}})
+                return
+            if not svc.fifo.acquire(blocking=True):
+                self._json(503, {"error": {"message": "the engine has no free place to start"}})
+                return
+            try:
+                svc.ensure_engine()
+            except Exception as e:  # noqa: BLE001 - the reason goes back to the caller
+                self._json(503, {"error": {"message": f"the engine did not start: {e}"}})
+                return
+            finally:
+                svc.fifo.release()
+            self._json(200, {"model": name, "status": {"value": "loaded"}})
+
+        def _models_sse(self):
+            """llama.cpp's /models/sse: the Models page's live state, a snapshot every few seconds."""
+            if not getattr(svc, "model_management", False):
+                self._json(404, {"error": {"message": "model management is off (\"model_management\": true, or "
+                                                      "MAYA_MODEL_MANAGEMENT=1, turns it on)"}})
+                return
+            if not self._authorized():
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    alive = not hasattr(svc.engine, "alive") or svc.engine.alive()
+                    value = "loaded" if alive else ("unloaded" if svc.unloaded else "loading")
+                    payload = {"object": "list", "data": [{"id": svc.model, "status": {"value": value}}]}
+                    self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                    self.wfile.flush()
+                    time.sleep(5)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def _cors_allow(self):
             """The Access-Control-Allow-Origin value for this request, or None: only /v1/* paths and only an origin the
@@ -4302,6 +4700,8 @@ def make_handler(svc: Service):
             self._json(200, out)
 
         def do_DELETE(self):
+            if self._foreign_page():
+                return
             if self.path.split("?")[0].startswith("/v1/responses/"):
                 self._response_resource(delete=True)
             elif self._authorized():
@@ -4309,6 +4709,9 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/models/sse":
+                self._models_sse()
+                return
             if path.startswith("/v1/responses/"):
                 self._response_resource()
                 return
@@ -4396,6 +4799,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
+                                 "max_text_file": text_file_limit(svc.engine.max_context),
                                  "model_label": svc.model_label,   # (the model first: "GLM-5.3 · Maya-S24")
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
                                  "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded})
@@ -4430,6 +4834,8 @@ def make_handler(svc: Service):
                     self.end_headers()
                     self.wfile.write(body)
             elif path == "/status":
+                if not self._authorized():   # (it carries `tail`: the last 600 characters written)
+                    return
                 with svc.status_lock:
                     s = dict(svc.status)
                     answering = svc.latest_request in svc.current_requests
@@ -4447,6 +4853,11 @@ def make_handler(svc: Service):
                     model = {"id": svc.model, "object": "model",
                              "status": {"value": "loaded" if loaded else "unloaded"},
                              "meta": {"n_ctx": svc.engine.max_context},
+                             # (the same capacity under the name generic OpenAI-compatible
+                             # clients read on a model listing: DeepSeek Harness's pi-ai discovery,
+                             # open-webui, llama.cpp's server clients, ... - n_ctx stays above;
+                             # no max_output_tokens: a client asking for the whole context as output gets a 400)
+                             "context_length": svc.engine.max_context,
                              # (videos: the llama.cpp encoder's - GLM's; DeepSeek's encoder reads pictures only)
                              "architecture": {"input_modalities": ["text"] if svc.vision is None else
                                               ["text", "image", "video"] if isinstance(svc.vision, Vision) else
@@ -4476,11 +4887,33 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
+        def _foreign_page(self) -> bool:
+            """A browser page on another site (its Origin neither this server nor in cors_origins): it can post a
+            text/plain body with no CORS preflight (CSRF), so it is refused before anything runs.  curl and the SDKs
+            send no Origin."""
+            origin = self.headers.get("Origin")
+            if not origin or origin.split("://", 1)[-1] == self.headers.get("Host", "") or self._cors_allow():
+                return False
+            self._json(403, {"error": {"type": "permission_error", "message": "requests from other web pages are "
+                                       "refused (the config's cors_origins lists the pages allowed)"}})
+            return True
+
+        def _fail(self, code, kind, message):
+            """An error as JSON, while nothing was sent; once an answer has begun (a stream), only the log has it."""
+            if self.answer_started:
+                print(f"[maya] request failed mid-answer: {message}", file=sys.stderr, flush=True)
+                self.close_connection = True
+                return
+            self._json(code, {"error": {"type": kind, "message": message}})
+
         def do_POST(self):
-            if not self._authorized():
+            if not self._authorized() or self._foreign_page():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             try:
+                if path in ("/models/load", "/models/unload"):
+                    self._llamacpp_model(path.rsplit("/", 1)[1])
+                    return
                 if path.startswith("/v1/responses/") and path.endswith("/cancel"):
                     self._response_cancel(path)
                     return
@@ -4558,19 +4991,20 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except BadBody as e:
-                self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                self._fail(e.status, "invalid_request_error", str(e))
             except (JobError, StoreBusy) as e:
-                self._json(getattr(e, "status", 503), {"error": {"type": "server_error", "message": str(e)}})
+                self._fail(getattr(e, "status", 503), "server_error", str(e))
             except ValueError as e:                          # (a ContextOverflow with its code: #432)
-                self._json(400, error_body(e))
-            except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                if self.answer_started:
+                    self._fail(400, "invalid_request_error", str(e))
+                else:
+                    self._json(400, error_body(e))
+            except EngineDied as e:
+                self._fail(503, "server_error", f"{e}; the next request restarts it")
             except (KeyError, TypeError, AttributeError, IndexError) as e:
                 # a field of the wrong shape (Strata: a 400 with the traceback in the log, not a dropped connection)
                 traceback.print_exc()
-                if not self.answer_started:
-                    self._json(400, {"error": {"type": "invalid_request_error",
-                                               "message": f"malformed request ({type(e).__name__}: {e})"}})
+                self._fail(400, "invalid_request_error", f"malformed request ({type(e).__name__}: {e})")
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
@@ -4690,6 +5124,13 @@ def make_handler(svc: Service):
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
+            # token frames are small and flushed as they come; Nagle would otherwise hold one
+            # for the peer's delayed ACK (~40 ms) on its way to the client.
+            try:
+                import socket
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -4763,9 +5204,11 @@ def make_handler(svc: Service):
             try:
                 if cancel.is_set():
                     raise ValueError("generation was cancelled before preparation")
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel,
+                                                     guard=svc._loop_guard_on(sampling))
                 if kw.get("_prefill"):
                     sampling["_prefill"] = kw["_prefill"]
+                sampling["_blocked"] = kw.get("_blocked")
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
                 config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
                 run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
@@ -4796,9 +5239,10 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
@@ -4889,9 +5333,10 @@ def make_handler(svc: Service):
             svc.check_request(req)                             # a bad sampling field: a 400, now
             messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, guard=svc._loop_guard_on(req))
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             watch_client(self, cancel)
@@ -5334,11 +5779,12 @@ def main() -> int:
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
-        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") != "hip":
+        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
             venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
         # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
         # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
-        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident")
+        # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
+        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
         engine_env = env
         if on_demand:
             fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
@@ -5432,6 +5878,9 @@ def main() -> int:
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     if svc.think_budget:
         print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
+    svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
+    if svc.model_management:
+        print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
     svc.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
     if not svc.loop_guard:
         print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
@@ -5452,8 +5901,9 @@ def main() -> int:
         svc.savings = savings.Ledger(p.parent / savings.FILE, p.name, svc.model, models.quant_label(cfg, p))
         threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
     args = [str(x) for x in cfg.get("args") or []]
-    if "--glm-pack" in args[:-1]:                       # the model's folder: the pack's parent holds its GGUF files
-        svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
+    flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
+    if flag:                                            # the model's folder: the parent of the pack or GGUF file
+        svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
     elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder

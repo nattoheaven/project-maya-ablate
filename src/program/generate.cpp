@@ -16,6 +16,8 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/platform/env_alias.hpp"
+#include "strata/platform/env_report.hpp"
+#include "strata/kernels/glm_fast.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -52,6 +54,7 @@
 #include "strata/core/prefix_cut.hpp"
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
+#include "strata/core/vram_mark.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -1762,6 +1765,13 @@ static int glm_pack_generate(const Options& o) {
     std::vector<DeferredPause> deferred_pauses;
     std::function<void()> gap_reset;
     std::chrono::steady_clock::time_point gap_mark;   // the read's start (after any restore), then each gap's end
+    // the GPUs the prompt-read line asks the free VRAM of: the ones the expert pool lives on (empty: every visible one)
+    const auto vram_devs = [&]() {
+        std::vector<int> d;
+        if (model.fast())
+            for (const auto& pv : model.pool_vram()) d.push_back(pv.dev);
+        return d;
+    };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
@@ -1840,16 +1850,35 @@ static int glm_pack_generate(const Options& o) {
             if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
         }
         std::vector<float> lg;
+        const strata::core::VramMark vram0 = strata::core::vram_mark(vram_devs());   // (the line at the read's end)
         t0 = std::chrono::steady_clock::now();
         gap_mark = t0;   // (STRATA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
-        // the state is saved before the LAST prompt token, so an identical or extending prompt can reuse it
+        // the state is saved before the generation prompt (snap_at), so an identical or extending prompt can reuse it
         bool snapped = false;
+        // THE SNAPSHOT'S POSITION: before the prompt's generation prompt (its trailing <|assistant|>, then <think> or
+        // <think></think>), where it used to stand before the last token.  The next prompt of this conversation goes on
+        // from the same place whatever came of this answer - the answer itself, nothing (a cancelled answer that the
+        // client sends again with a new message after it), or the same prompt again - so it continues the snapshot
+        // instead of leaving it at the <|assistant|> it no longer has.  Opt-in (STRATA_GLM_SNAP_GEN=1): the prompt's
+        // last 2-4 tokens then go through the token path instead of the batched one, so a greedy answer can differ
+        // from a read with the snapshot before the last token (the default).
+        size_t snap_at = prompt.size() - 1;
+        {
+            static const bool snap_gen = env_num("STRATA_GLM_SNAP_GEN", 0) != 0;
+            constexpr int32_t kAsstTok = 154828;   // <|assistant|>
+            // (at `reuse` itself too: the same prompt again restores the snapshot there and keeps it there)
+            for (size_t k = 2; snap_gen && k <= 4 && k <= prompt.size(); ++k) {
+                const size_t a = prompt.size() - k;
+                if (a < reuse || a == 0) break;
+                if (prompt[a] == kAsstTok) { snap_at = a; break; }
+            }
+        }
         // the batched prompt path (glm_prefill.cu) reads all but the last prompt token in chunks, layer by layer;
         // the last one goes through the token path, which leaves the logits the first sample reads
         const int pchunk = model.fast() ? model.prefill_chunk() : 0;
         size_t i_first = reuse;
-        if (pchunk > 0 && prompt.size() - reuse > 1) {
+        if (pchunk > 0 && snap_at > reuse) {
             // one call for everything but the last token: the two halves of a split pipeline the chunks; PP lines
             // (the server's progress and heartbeat) come from the progress callback, possibly on the tail's thread.
             // A checkpoint position (ckpt_marks) ends a call: the state there is kept, and the next call goes on.
@@ -1862,7 +1891,7 @@ static int glm_pack_generate(const Options& o) {
                             (double) done / (ms / 1000.0 + 1e-9), reuse);
                 std::fflush(stdout);
             };
-            std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
+            std::vector<size_t> marks = ckpt_marks(prompt, reuse, snap_at);
             // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
             const size_t sys_end = strata::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
             // without checkpoints (STRATA_GLM_CKPTS=0, the several-conversation scheduler) the read still ends a call
@@ -1880,7 +1909,7 @@ static int glm_pack_generate(const Options& o) {
             size_t mi = 0, seg_start = at;
             // STRATA_GLM_PREFILL_GAPS: a gap before the read too (a round for the running requests) - back-to-back reads
             // would otherwise stall them for the last stage of one and the first of the next
-            if (read_gap_first && prompt_between && at < prompt.size() - 1) {
+            if (read_gap_first && prompt_between && at < snap_at) {
                 const int r = prompt_between();
                 if (r == 1) {
                     pok = false;
@@ -1891,8 +1920,8 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             int seg_chunk = 0;   // (exact pieces: the chunk the segment's uncut read takes, from its first piece on)
-            while (pok && at < prompt.size() - 1) {
-                const size_t seg_end = mi < marks.size() ? marks[mi] : prompt.size() - 1;
+            while (pok && at < snap_at) {
+                const size_t seg_end = mi < marks.size() ? marks[mi] : snap_at;
                 size_t piece = prompt_piece ? prompt_piece() : 0;
                 if (piece > 0 && interleave.exact) {
                     // whole chunks of the uncut read, each call cut in them: the same arithmetic, the same answer
@@ -1925,9 +1954,17 @@ static int glm_pack_generate(const Options& o) {
                         seg_start = end;
                         seg_chunk = 0;
                     }
+                    // a cancel between two calls: a call that is one chunk (a checkpoint every chunk, or a piece) never
+                    // asks the progress callback, so with one conversation the read ran to its end after the client had
+                    // gone - it stops here, at the checkpoint just kept (a cancelled read keeps it, below)
+                    if (at < snap_at && !prompt_between && read_stopped()) {
+                        pok = false;
+                        err = "cancelled";
+                        break;
+                    }
                     // more to read: the decoding requests' turn (none after the last piece - its last token's logits
                     // must still be on the tail when the first sample reads them)
-                    if (at < prompt.size() - 1 && prompt_between) {
+                    if (at < snap_at && prompt_between) {
                         pp_line(at - reuse);
                         const int r = prompt_between();
                         if (r == 1) {
@@ -1950,12 +1987,45 @@ static int glm_pack_generate(const Options& o) {
             // rest to the token path below - from where the prompt path stopped, not from `reuse`
             i_first = at;
             if (pok) {
-                i_first = prompt.size() - 1;
-                pp_line(prompt.size() - 1 - reuse);
+                i_first = snap_at;
+                pp_line(snap_at - reuse);
             } else if (err == "cancelled") {
-                snap_tokens.clear();
-                model.reset();
-                ckpt_drop_past(0);
+                // A CANCELLED READ keeps what it read: the longest checkpoint of this prompt the read has reached (one
+                // it kept itself, or an earlier one it started from) becomes the snapshot, so the client's retry - an
+                // agent that gave up waiting and sends the same prompt again - goes on from there instead of reading
+                // it all again, and a conversation that runs in between sets it aside in a slot.  The DSA rows before
+                // the checkpoint were written by calls that ended; the cancelled call wrote only past it.
+                // STRATA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
+                static const bool keep_cancelled = env_num("STRATA_GLM_KEEP_CANCELLED", 1) != 0;
+                size_t kept = 0;
+                if (keep_cancelled && ckpt_max > 0 && cur_img_pos.empty()) {
+                    int best = -1;
+                    for (int c = 0; c < (int) ckpts.size(); ++c) {
+                        const auto& t = ckpts[(size_t) c].tokens;
+                        if (!t.empty() && t.size() <= at && (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
+                            std::equal(t.begin(), t.end(), prompt.begin()))
+                            best = c;
+                    }
+                    std::string ce;
+                    if (best >= 0 && model.ckpt_restore(best, ce) && model.snapshot_save()) {
+                        kept = ckpts[(size_t) best].tokens.size();
+                        snap_tokens.assign(prompt.begin(), prompt.begin() + (long) kept);
+                        snap_img_hash = img_hash(kept);
+                        snap_in_slot = false;
+                        ckpts[(size_t) best].used = ++ckpt_clock;
+                        ckpt_drop_past(kept);
+                        std::fprintf(stderr, "glm checkpoints: the cancelled read keeps %zu of the prompt's %zu tokens\n",
+                                     kept, prompt.size());
+                    } else if (best >= 0) {
+                        std::fprintf(stderr, "glm checkpoints: the cancelled read keeps nothing (%s)\n",
+                                     ce.empty() ? "no snapshot" : ce.c_str());
+                    }
+                }
+                if (kept == 0) {
+                    snap_tokens.clear();
+                    model.reset();
+                    ckpt_drop_past(0);
+                }
                 finish = "cancel";
                 i_first = prompt.size();
             } else if (!err.empty()) {
@@ -1968,9 +2038,9 @@ static int glm_pack_generate(const Options& o) {
         for (size_t i = i_first; i < prompt.size();) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
-            if (model.fast() && !snapped && i == prompt.size() - 1) {
+            if (model.fast() && !snapped && i == snap_at) {
                 if (model.snapshot_save()) {
-                    snap_tokens.assign(prompt.begin(), prompt.end() - 1);
+                    snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());
                     snap_in_slot = false;
                 } else {
@@ -1979,7 +2049,7 @@ static int glm_pack_generate(const Options& o) {
                 snapped = true;
             }
             size_t chunk = std::min<size_t>(8, prompt.size() - i);
-            if (model.fast() && !snapped && i + chunk > prompt.size() - 1) chunk = prompt.size() - 1 - i;
+            if (model.fast() && !snapped && i < snap_at && i + chunk > snap_at) chunk = snap_at - i;
             std::vector<int32_t> part(prompt.begin() + (long) i, prompt.begin() + (long) (i + chunk));
             const bool ok = model.forward(part, lg, err);
             if (!ok) {
@@ -1995,6 +2065,13 @@ static int glm_pack_generate(const Options& o) {
                             (double) (i - reuse) / (ms / 1000.0 + 1e-9), reuse);
             }
             if (read_stopped()) { finish = "cancel"; break; }
+        }
+        {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
+            const std::string vt = strata::core::vram_mark_text(vram0, strata::core::vram_mark(vram_devs()));
+            if (!vt.empty())
+                std::fprintf(stderr, "glm vram: prompt %zu tokens read in %.1f s; %s\n",
+                             prompt.size() > reuse ? prompt.size() - reuse : (size_t) 0,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), vt.c_str());
         }
         return 0;
     };
@@ -4290,6 +4367,24 @@ static int glm_pack_generate(const Options& o) {
 
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
+    {
+        // the GLM tuning settings taken from the environment, said once at start (#6), with the value used where the
+        // engine clamps one (the same ranges as where each is read)
+        namespace gf = strata::kernels::glmf;
+        static const strata::platform::EnvRange kRanges[] = {
+            {"GLM_PREFETCH_N", 0, gf::kSpares - 1, "at most kSpares-1"},          // glm_fast_path.cu
+            {"GLM_AHEAD", 0, gf::kAhead, "at most kAhead"},                       // glm_fast_path.cu
+            {"GLM_DISK_SKIP_FROM", 0, 8, "0-8"},                                  // glm_fast_path.cu
+            {"GLM_PREFILL_SUB", 16, 8192, "16-8192"}};                            // glm_prefill.cu
+#if defined(_WIN32)
+        char** env = _environ;
+#else
+        char** env = environ;
+#endif
+        const std::string line = strata::platform::env_report(env, "GLM_", "glm settings from the environment",
+                                                              kRanges, sizeof(kRanges) / sizeof(kRanges[0]));
+        if (!line.empty()) std::fprintf(stderr, "%s\n", line.c_str());
+    }
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -8021,6 +8116,7 @@ int main(int argc, char** argv) {
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
+    bool spec_go = false;   // the speculative loop runs (spec_pos can be 0: a native pack's prompt read by windows)
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
@@ -8077,6 +8173,35 @@ int main(int argc, char** argv) {
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
         }
+        // --dump-logits (issue #658): the header announces a row for every position from 0, and the batched path
+        // computes no head - so each chunk's rows go through the token path's head from the final residuals the
+        // chunk leaves (what the draft layer reads too).  The prompt is read as without the dump: the same answer.
+        if (dump != nullptr) {
+            auto mtp_chunk = prefill.on_chunk;   // (empty without --mtp)
+            prefill.on_chunk = [&, mtp_chunk](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                strata::core::BlockBuffers bb = ss.block;
+                for (int64_t t = 0; t < T; ++t) {
+                    if (!strata::program::logits_selection::selected(p0 + t, dump_positions, o.logits_stride)) continue;
+                    bb.R = const_cast<float*>(R_rows) + (size_t) t * (size_t) (g.hc * g.n_embd);
+                    const bool ok = native_head.loaded()
+                                        ? strata::core::lm_head_mix(wt, g, bb, main_cs, e) &&
+                                              native_head.run(bb.mixed, d_logits, main_cs, e)
+                                        : strata::core::lm_head(wt, g, bb, d_logits, main_cs, e);
+                    if (!ok) return false;
+                    if (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4, cudaMemcpyDeviceToHost,
+                                        (cudaStream_t) main_cs) != cudaSuccess ||
+                        cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+                        e = "reading a prompt row's logits back failed";
+                        return false;
+                    }
+                    if (std::fwrite(logits.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
+                        e = "cannot write logits at position " + std::to_string(p0 + t);
+                        return false;
+                    }
+                }
+                return !mtp_chunk || mtp_chunk(R_rows, T, p0, e);
+            };
+        }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -8121,7 +8246,7 @@ int main(int argc, char** argv) {
 
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
-        if (native_pack) { spec_pos = pos; break; }
+        if (native_pack) { spec_pos = pos; spec_go = true; break; }
         if (pos >= o.max_context) {
             std::fprintf(stderr, "maya generate: ran out of context at position %lld\n", (long long) pos);
             return 2;
@@ -8330,7 +8455,7 @@ int main(int argc, char** argv) {
         ss.ple_prev[1] = (int32_t) tok;
         tok = (pos + 1 < n_prompt) ? o.tokens[(size_t) (pos + 1)] : next;
         // Plan v0.3 P6: from the first generated token on, the speculative loop below takes over.
-        if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; break; }
+        if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; spec_go = true; break; }
     }
 
     // ================================ plan v0.3 P6: SPECULATIVE DECODING ================================
@@ -8340,7 +8465,7 @@ int main(int argc, char** argv) {
     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
-    if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
+    if (spec_go && (int64_t) produced.size() < o.max_new && !ended) {
         std::vector<int64_t> oracle;
         if (!o.spec_oracle.empty()) {
             std::ifstream in(o.spec_oracle);
@@ -8459,6 +8584,48 @@ int main(int argc, char** argv) {
         };
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
+        // --dump-logits (issue #658): the rows of the positions a window keeps, in order.  A native pack's prompt
+        // positions the batched path left (--prefill-until) are read here first, through teacher-forced windows
+        // (every token committed, the draft layer given their residuals as the batched chunks give it), so their rows
+        // are written too and the answer starts after the whole prompt
+        std::vector<float> dump_rows(dump != nullptr ? (size_t) o.spec * (size_t) n_vocab : 0);
+        auto dump_window = [&](int64_t pos0, int rows) -> bool {
+            if (dump == nullptr || rows <= 0) return true;
+            if (!ver.read_head_logits(rows, dump_rows.data(), err)) return false;
+            for (int r = 0; r < rows; ++r) {
+                if (!strata::program::logits_selection::selected(pos0 + r, dump_positions, o.logits_stride)) continue;
+                if (std::fwrite(dump_rows.data() + (size_t) r * (size_t) n_vocab, sizeof(float), (size_t) n_vocab, dump) !=
+                    (size_t) n_vocab) {
+                    err = "cannot write logits at position " + std::to_string(pos0 + r);
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (dump != nullptr && native_pack && p < n_prompt - 1) {
+            ver.set_head_sampling(false);
+            std::vector<int32_t> win((size_t) o.spec), outw((size_t) o.spec), nxt((size_t) o.spec);
+            while (p < n_prompt - 1) {
+                const int T = (int) std::min<int64_t>(o.spec, n_prompt - 1 - p);
+                for (int t = 0; t < T; ++t) {
+                    win[(size_t) t] = (int32_t) o.tokens[(size_t) (p + t)];
+                    nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p + t + 1)];
+                }
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
+                if (!ver.run(T, win.data(), p, &drive_pool_multi, &drive, outw.data(), err) || drive.d.failed ||
+                    !ver.commit(T, err) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, p, err)) ||
+                    !dump_window(p, T)) {
+                    if (drive.d.failed && drive.d.fail) err = drive.d.fail;
+                    std::fprintf(stderr, "maya generate: reading the prompt for --dump-logits: %s\n", err.c_str());
+                    return 1;
+                }
+                p += T;
+            }
+            ver.set_head_sampling(true);
+            x = (int32_t) o.tokens[(size_t) p];
+        }
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
@@ -8554,10 +8721,16 @@ int main(int argc, char** argv) {
             ++accepted_hist[(size_t) a];
             if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
             bool eos = false;
+            const size_t produced0 = produced.size();
             for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
                 if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+            }
+            if (!dump_window(p, (int) (produced.size() - produced0))) {
+                if (adapt_thr.joinable()) adapt_thr.join();
+                std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+                return 1;
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
