@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO = "mw00/project-maya"
+REPO = "nattoheaven/project-maya-ablate"
 UPDATE_EXIT = 75                    # the server's exit code that tells maya.py: updated, start again (EX_TEMPFAIL)
 RESTART_EXIT = 76                   # ... the dashboard saved a new port: start again with the saved config
 SUPERVISED = "MAYA_RESTART_ON_UPDATE"   # set by maya.py for the server it starts: it starts it again after an update
