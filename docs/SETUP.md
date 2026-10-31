@@ -129,6 +129,46 @@ downloads the new code (git), compiles only the engine files that changed and lo
 is not downloaded again, and your settings stay. By hand: `git pull`, then `./setup.sh`.
 (The check asks GitHub for the latest release, at most every six hours; `MAYA_UPDATE_CHECK=0` turns it off.)
 
+## Running Maya as a systemd service
+
+Set the model up and start it by hand once first, then let a unit start it at boot. The unit runs the config the setup
+wrote (`maya-<model>.json`, in the Maya folder):
+
+```ini
+[Unit]
+Description=Maya
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=you
+WorkingDirectory=/path/to/maya
+ExecStart=/path/to/maya/maya.sh --config /path/to/maya/maya-<model>.json
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=3600
+TimeoutStopSec=600
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- **Time to start and stop.** A big model at a long context takes a long time to load (the engine pins its expert tier
+  in RAM and warms its caches), and the more context you give it (1M tokens, say), the longer. systemd ends a unit that
+  is not up inside `TimeoutStartSec` and starts it again, which then loads again, for ever. Set it well above the
+  slowest start you have seen by hand (`TimeoutStartSec=infinity` turns it off). `TimeoutStopSec` is the time Maya has
+  to save its conversations and free the GPUs after the stop signal; give a big model several minutes.
+- **Run the calibration once, by hand, first.** A start measures nothing when nobody is there to wait (a service, a
+  pipe, `--yes`): it prints one line naming what it skipped and starts with the engine's defaults. Run the
+  calibrations yourself in a terminal while the service is stopped (`./maya.sh --config maya-<model>.json
+  --speed-calibration --no-start`, and for MiniMax `--calibrate --no-start` too). They load the model a few times and
+  keep the answer in the config, so the service starts straight from it afterwards. A terminal start of the same config
+  still measures what is missing, as before.
+- **Logs.** The server's output (the same lines a terminal shows) goes to the journal: `journalctl -u maya -f`. The
+  engine writes its own log to the file named by `"log"` in the config, `maya-<model>.log` beside it by default.
+- The model needs the whole machine: stop the service before a calibration, a setup or `--check`, and do not start two
+  units on the same GPUs.
+
 ## Options
 
 | Option | |
@@ -144,7 +184,7 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | `--model-dir DIR` | use DeepSeek-V4.1-Flash-1017's files you already have: the folder with a GGUF's shards, or with the EXL3 quant's files and the Engram shards `model-00047-of-00048.safetensors` / `model-00048-of-00048.safetensors` of DeepSeek's repo (it must be writable: the pack goes inside it). Or an EXL3 folder of GLM-5.3-Flash or MiniMax-M3.1-Flash at any bit rate that is not one of the listed downloads (turboderp's other branches, Mia-AiLab's other bit rates): the setup reads the folder's own `config.json` and `model.safetensors.index.json`, checks each file whole by its header, never offers the listed downloads for it, writes a config named after the folder (`maya-<folder>.json`) and uses the folder's own sampling (`generation_config.json`) and chat template (`chat_template.jinja`) - GLM's / MiniMax's where the folder has none. MiniMax: `--model MiniMax-M3.1-Flash --model-dir DIR` is the same |
 | `--ds4-quant Q` | DeepSeek-V4.1-Flash-1017's files: `maya-s`, `maya-xs` (Maya's quants, the same as `--model deepseek-maya-s` / `deepseek-maya-xs`; Maya-S the default), `gguf-q8` (unsloth's UD-Q8_K_XL GGUF), `gguf-q4` (its UD-Q4_K_XL: dense weights Q8_0; not in the setup's list, named by hand), `exl3` (LibertAIDAI's EXL3 quant at 2.9 bits), `exl3-3.5` (its 3.5-bit quant: closer to the original, about 280 GB of VRAM and RAM), `abliterated-128g` / `abliterated-256g` (orcarouter's abliterated model as its Mix-128G / Mix-256G GGUF, with Maya's Q6_K n-gram tables; `abliterated`: the one this PC holds; a gated repo: `HF_TOKEN` or `hf auth login`); the EXL3 quants need NVIDIA V100 or newer (pictures: RTX 30 / A100 or newer) and are offered only there, and on AMD as experimental (as GLM's EXL3 quants there; [docs/EXL3_HIP.md](EXL3_HIP.md)) |
 | `--mm3-quant Q` | MiniMax-M3.1-Flash's files: `exl3` (Mia-AiLab's EXL3 quant at 3.5 bits, NVIDIA), `maya-xs` or `maya-s` (Maya's GGUF quants, the same as `--model minimax-maya-xs` / `minimax-maya-s`; `gguf-xs` / `gguf-s` before) |
-| `--no-vision` | text only: no image encoder (DeepSeek, MiniMax: their vision tower off) |
+| `--no-vision` | text only: no image encoder (DeepSeek, MiniMax: their vision tower off; Qwen-3.8-Flash-Next: no mmproj download) |
 | `--draft mtp` / `--draft dflash2` | how the model drafts tokens ahead: its MTP block (the default), or a DFlash2 drafter - downloaded (0.7 GB) into `DIR/GLM-5.3-Flash-DFlash2/` and passed as `--dflash` (Maya-L: +44% on nine GPUs, +12% on two, +19% on one GPU; NVIDIA RTX 30 / A100 and newer, and one AMD Ryzen AI Max APU (Strix / Gorgon Halo) - older cards and other AMD GPUs keep the MTP block unless you pass this; the drafter's license is CC BY-NC-ND 4.0, non-commercial use only). The [speed calibration](SETTINGS.md#the-speed-calibration) then keeps it only if it is faster on your PC |
 | `--gpu N` / `--gpus 0,1,2,3` | one GPU, or several (up to 16) that split the model's layers |
 | `--context N` | context length in tokens: 8192, 32768 (default), 65536, 131072; DeepSeek: 32768, 65536, 131072, 262144, 524288, 1048576 (the default 262144 where VRAM + RAM hold the model, else 65536); MiniMax: the same, the default by this PC's memory |

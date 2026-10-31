@@ -65,7 +65,7 @@ recommends one for your PC; to pick one yourself, give its setup id: `./setup.sh
 All of them run on NVIDIA from the V100 / RTX 20 on, and on AMD and Windows (experimental; see
 [What you need](#what-you-need)). DeepSeek's sizes include its Engram tables. The setup also offers unsloth's GGUF and
 LibertAIDAI's EXL3 quants of DeepSeek, orcarouter's abliterated DeepSeek, Mia-AiLab's EXL3 quant of MiniMax,
-turboderp's EXL3 quants of GLM, and Qwen-3.8-Flash-Next (CYBER-FROST) as its Q5_K_M GGUF, text only
+turboderp's EXL3 quants of GLM, and Qwen-3.8-Flash-Next (CYBER-FROST) as its Q5_K_M GGUF, with pictures
 ([its settings](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Each model's files, drafters, pictures and options:
 [docs/MODELS.md](docs/MODELS.md).**
 
@@ -220,7 +220,7 @@ slowest while the caches fill with what you use.
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. Pascal (Tesla P40 / P100, GTX 10) is experimental, not validated yet. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 and Radeon PRO V620 / W6800 not validated yet; GLM-5.3-Flash reads text only there, DeepSeek-V4.1-Flash-1017 pictures too - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
+| **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. Pascal (Tesla P40 / P100, GTX 10) is experimental, not validated yet. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 and Radeon PRO V620 / W6800 not validated yet; GLM-5.3-Flash and DeepSeek-V4.1-Flash-1017 read pictures there too - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB runs it. More RAM keeps more experts close and is faster |
 | **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for GLM-5.3 · Maya-S, ~160 GB for GLM-5.3 · Maya-L, ~350 GB for DeepSeek V4.1 · Maya-S, ~520 GB for unsloth's GGUF of it, ~95 GB for MiniMax M3.1 · Maya-XS, ~200 GB for MiniMax-M3.1-Flash's EXL3 quant) and its picture encoder (1.1 GB). Not a hard disk |
 | **System** | Linux (x86-64; a CPU with AVX2 is best), the NVIDIA driver, CUDA 12.x (CUDA 13 works for RTX 20 and newer, not for the V100 or Pascal), g++, Python 3.10+. Windows 10/11 (experimental): [docs/WINDOWS.md](docs/WINDOWS.md). Not WSL2. AMD: ROCm 7 |
@@ -269,8 +269,9 @@ your setup and the engine's speed lines; nothing is sent anywhere by itself. The
 
 ## Support
 
-Project Maya is free and open source. Every release is tested on real machines before it ships, and sponsorship
-pays for that test hardware (the current goal: 50 monthly sponsors for a Mac and new GPUs, so Maya runs well on more hardware), for building
+Project Maya is free and open source. Every release is tested on our own NVIDIA and AMD machines before it ships (the
+Mac support so far only on GitHub's virtual Macs), and sponsorship pays for that test hardware (the current goal: 50
+monthly sponsors for a real Mac and new GPUs, so Maya runs well on more hardware), for building
 new quants and models, and for faster fixes. If Maya saves you a cloud bill, consider sponsoring a small part of it
 back - thank you!
 

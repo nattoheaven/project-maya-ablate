@@ -4,6 +4,92 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.43 - 2026-10-31
+
+DeepSeek-V4.1-Flash now runs unsloth's DeepSeek GGUF quants, and the setup lists UD-IQ3_S: close to Q8's quality for PCs
+with about 270 GB of VRAM + RAM. Long agent conversations are no longer read again from the start when the loop guard
+steps in (the next turn came back about 15x sooner in our tests), answers that write a turn-end marker inside their
+thinking now finish, and the Monitor shows which drafter runs and how many of its drafts the model keeps, live. Maya
+started as a service skips the speed calibration instead of looping, and experts read from the SSD use as many reads at
+once as the drive serves fastest. Against v1.1.42 on our test PCs, decode and prompt speeds
+are unchanged for every model.
+
+- **DeepSeek: unsloth's GGUF quants** (thanks to unsloth for the quants):
+  - **UD-IQ3_S** is in the setup's list, between Maya-S and the Q8 (`--ds4-quant gguf-iq3_s`). It measures close to
+    Q8: a KLD of 0.061 against the original model, where Q8 has 0.047 and Maya-S 0.119 (KLD: how far the quant's
+    next-token choices drift from the original's; lower is better). About 262 GB of VRAM + RAM hold it, plus the
+    161 GB of n-gram tables read from the SSD.
+  - The other unsloth quants can be set up by hand: `--ds4-quant gguf-iq1_s`, `gguf-iq1_m`, `gguf-iq2_xxs`,
+    `gguf-q2_k_xl`, `gguf-iq3_xxs` and `gguf-q3_k_xl`, pinned to unsloth's 2026-10-28 upload; UD-Q4_K_XL and
+    UD-Q8_K_XL work as before.
+  - Pictures with every unsloth quant, from the picture encoder file in unsloth's own repo (a 0.97 GB download).
+  - One copy of the n-gram tables: UD-IQ3_S and Maya's quants hold the same 161 GB of tables, so with one of them on
+    the disk the setup of the other reuses that copy instead of downloading it again.
+  - The setup's free-space check counts each file against the disk it actually lands on.
+- **Agents and the loop guard:**
+  - A long conversation's prompt is kept whole when the loop guard steps in, so the conversation cache is still used:
+    on a 150K-token agent conversation the next turn took about 15x less time with GLM and with DeepSeek (#704, thanks
+    @tonykee; fixes #702). `MAYA_LOOP_GUARD_COLLAPSE_MAX` sets the size from which a prompt is left whole.
+  - The loop guard's follow-up call always fits the context: an answer it lets go on, or a request without
+    `max_tokens`, no longer ends in an engine error (a v1.1.41 regression; #696, thanks @Jellepepe).
+  - A turn-end marker written inside the thinking is now read as the model's text: the answer goes on and finishes
+    instead of stopping mid-thinking, with DeepSeek and GLM, and a client's own stop strings work inside code again
+    (#709, thanks @markrussi).
+- **Monitor:** the Speculation card shows the drafter that runs (DSpark, DFlash2, MTP, prompt lookup) and the share of
+  its drafts the model keeps, live while an answer is written, for GLM, DeepSeek, MiniMax and Qwen. "SSD only" in
+  "Where the experts live" now shows its GB, and the Throughput card has no blank space on a phone any more.
+- **Running Maya as a service:** a start with no terminal (systemd, a script, or `--yes`) begins with the default
+  settings instead of measuring first, and prints the one command to run the calibration later. A service no longer
+  loops for ever when its start timeout ends the calibration. docs/SETUP.md has a systemd section (#690, thanks
+  @ZackO2o for the report).
+- **Experts read from the SSD (Linux):** how many reads run at once is now measured for each drive at its first start (about
+  a second, then remembered), instead of guessed from the CPU. On an NVMe beside an 8 GB card, Qwen CYBER-FROST
+  decoded up to 5% faster with its experts read from the SSD.
+
+## v1.1.42 - 2026-10-30
+
+Pictures on every model and every build: GLM-5.3-Flash now reads pictures on AMD GPUs too, Qwen-3.8-Flash-Next
+(CYBER-FROST) reads pictures for the first time, and DeepSeek and MiniMax read them on every setup again. DeepSeek reads
+long first prompts 16-24% faster and its two-GPU tensor-parallel prompts about 1.5x faster on PCs with few CPU cores,
+GLM's automatic prompt chunk is up to 3.4x faster on cards where it chose too small a chunk, and an idle Maya no longer
+keeps a CPU core busy. Against v1.1.41 on our test PCs, an 8K-token DeepSeek prompt
+read about 1.27x faster on one GPU and 1.1x faster with `--tp 2`; decode, and the other models' speeds, are unchanged.
+
+- **Pictures on every model and every build:**
+  - GLM-5.3-Flash reads pictures on AMD GPUs - Linux and Windows, discrete cards and Ryzen AI Max APUs (#345, thanks
+    @Ehco). The encoder's matmuls and attention now add up in float32 on the GPU, so its answers about a picture match
+    the CPU encoder's on AMD (they drifted on a few image patches before) and on NVIDIA's newer cards too.
+  - Qwen-3.8-Flash-Next (CYBER-FROST) reads pictures. The setup downloads its 0.9 GB image encoder (it asks first),
+    and the encoder runs on the GPU in memory the engine lends it while a picture is read: on an 8 GB card the expert
+    cache and, if need be, the draft layer's experts are lent and read back afterwards. On an 8 GB card a picture is
+    read about 3.6x faster than with the CPU encoder; text answers before and after a picture are the same.
+  - DeepSeek reads pictures with the EXL3 quants on V100s too, and the setup says why a PC short of RAM reads text
+    only. A MiniMax setup run again turns pictures on (it kept an earlier "off" before). `--no-vision` keeps them off
+    for every model.
+- **DeepSeek:**
+  - Long prompts (#691, thanks @needmorevram): the restore points near the end of a prompt are kept in one read, and
+    a chunk streams only the experts it picks. A fresh 20-30K-token prompt read 16-24% faster on one and on two GPUs
+    in our tests, with the same output. Lending EXL3 chunk buffers from the expert cache and reading host-summed
+    pieces back by DMA are opt-in for now (`MAYA_DS4_EXL3_LEND=1`, `DS4_AR_BACK_DMA=1`).
+  - GGUF `--tp 2`: each GPU of a tensor-parallel pair reads only its own part of an expert from the files - on a PC
+    with few CPU cores its prompts took about two thirds of the time (#670, thanks @speja969 for the measurements).
+  - A slow PCIe link (one expert takes 1 ms or more) streams one expert at a time, and the link is measured on the
+    same stream as the loads, which gave back the decode speed lost on such a PC (#609, thanks @SeriousRising, who
+    found the cause).
+  - A GPU too small for the model's dense weights stops at the start with what it needs, instead of a memory error
+    part way into the load.
+- **GLM:** `--prefill auto` no longer falls back to 768-token chunks when the prestage buffer does not fit whole beside
+  a bigger chunk; on such a card a 19K-token prompt read about 3.4x faster (#673, thanks @pietroMastro92).
+- **An idle Maya stays idle** (#685, thanks @vbooka1 for the measurements): after a minute without a request the
+  engines' CPU-lane threads sleep until the next request wakes them (DeepSeek's used up to 12% of a core doing
+  nothing, now none), and the setup screen and the hardware sampler slow down when nothing runs. The first answer
+  after a quiet spell comes as fast as before.
+- **Settings:** a `MAYA_...` setting in a config's `"env"` now reaches the engine under either of its names (#686,
+  thanks @mgabor3141).
+- **Setup:** a discrete NVIDIA card without Resizable BAR is no longer called "shared with the system" (#671, thanks
+  @speja969).
+- **MiniMax:** a routing id outside the experts ends the request with an error that says where, instead of a crash.
+
 ## v1.1.41 - 2026-10-30
 
 A community release: 36 contributions. DeepSeek reads the first long prompt after a start about 1.3x faster on

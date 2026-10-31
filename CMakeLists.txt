@@ -291,6 +291,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_report_test.cpp")
   add_test(NAME env_report_test COMMAND env_report_test)
 endif()
 
+# ---- idle_gate_test --------------------------------------------------------
+# The gate an idle engine's service threads sleep on, and a request's line wakes (strata/platform/idle_gate.hpp):
+# host code only, like env_report_test above.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/idle_gate_test.cpp")
+  add_executable(idle_gate_test EXCLUDE_FROM_ALL tests/idle_gate_test.cpp)
+  target_include_directories(idle_gate_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(idle_gate_test PRIVATE strata_warnings)
+  find_package(Threads)
+  if(Threads_FOUND)
+    target_link_libraries(idle_gate_test PRIVATE Threads::Threads)
+  endif()
+  add_test(NAME idle_gate_test COMMAND idle_gate_test)
+endif()
+
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the
 # whole point of P1.S9 is that the decision is arithmetic you can check by hand.
@@ -566,6 +580,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(file_expert_source_test PRIVATE strata_engine)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
+  endif()
+  # the expert cache's tail lent to the on-demand vision encoder and taken back (needs a GPU: 77 skips)
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_cache_lend_test.cpp")
+    enable_testing()
+    add_executable(expert_cache_lend_test tests/core/expert_cache_lend_test.cpp)
+    target_include_directories(expert_cache_lend_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(expert_cache_lend_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    add_test(NAME expert_cache_lend_test COMMAND expert_cache_lend_test)
+    set_tests_properties(expert_cache_lend_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the EXL3 prompt

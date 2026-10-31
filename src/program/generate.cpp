@@ -16,6 +16,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/platform/env_alias.hpp"
+#include "strata/platform/idle_gate.hpp"
 #include "strata/platform/env_report.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/core/expert_source.hpp"
@@ -108,6 +109,13 @@ namespace {
 bool refill_blocking() {
     static const bool v = std::getenv("STRATA_REFILL_BLOCKING") != nullptr;
     return v;
+}
+
+// The bytes the on-demand vision encoder needs on the first GPU (what the server measured, STRATA_GLM_VISION_LEND_MB
+// - the variable is named for the engine that had it first); 0 = no on-demand encoder.
+uint64_t vision_lend_need() {
+    const char* v = std::getenv("STRATA_GLM_VISION_LEND_MB");
+    return v != nullptr && std::atoll(v) > 0 ? (uint64_t) std::atoll(v) << 20 : 0;
 }
 
 using Clock = std::chrono::steady_clock;
@@ -1231,6 +1239,7 @@ static int glm_pack_generate(const Options& o) {
                 }
             };
             while (getline_fd(l)) {
+                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 if (l.rfind("STOP ", 0) == 0 || (l.rfind("PAUSE ", 0) == 0 && l != "PAUSE keep")) {
@@ -2170,6 +2179,7 @@ static int glm_pack_generate(const Options& o) {
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
+        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;   // (the drafts this request so far: STAT, DONE)
         int64_t produced = 0;
         // one emitted token: the T line, the live tier counters every 8 tokens, the stop conditions (false: stop)
         // LOOP GUARD: a heavily quantized model can fall into repeating a short pattern ("0 0 0 ...") until the
@@ -2254,12 +2264,15 @@ static int glm_pack_generate(const Options& o) {
                 const double n = (double) produced;
                 const uint64_t h = sn.hits - st1.hits, m = sn.misses - st1.misses;
                 std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
-                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f\n",
+                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f "
+                            "disk_gb=%.1f draft_acc=%llu draft_off=%llu\n",
                             n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                             (double) (sn.ram_hits - st1.ram_hits) / n, (double) (sn.disk_reads - st1.disk_reads) / n,
                             (double) (sn.promotions - st1.promotions) / n, (long long) sn.pool_used,
                             (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                            sn.pool_gb);
+                            sn.pool_gb, std::max(0.0, sn.all_gb - sn.pool_gb - sn.ram_gb),
+                            (unsigned long long) (model.spec_hits_ - hits0),
+                            (unsigned long long) (model.spec_steps_ - spec0));
             }
             bool eos_hit = false;
             for (const int64_t e : eos)
@@ -2274,7 +2287,6 @@ static int glm_pack_generate(const Options& o) {
             }
             return produced < max_new;
         };
-        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
         if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
             // the DFlash decode: a block of drafts a round, one verify window checks them (same tokens as the loop
             // below for the same samples); --spec T caps a round's window at T tokens
@@ -2536,6 +2548,7 @@ static int glm_pack_generate(const Options& o) {
     uint64_t multi_n = 0;        // tokens since the engine last had nothing to do (the STAT lines' rate)
     std::chrono::steady_clock::time_point multi_t1;
     strata::core::Glm5Model::FastStats multi_st1;
+    uint64_t multi_spec0 = 0, multi_hits0 = 0, multi_mtp_acc = 0, multi_mtp_off = 0;   // (the drafts since then, for the STAT lines)
     const auto input_pending = [&]() -> bool {
         std::lock_guard<std::mutex> lk(in_mu);
         return !in_lines.empty() || quit_req.load();
@@ -2617,13 +2630,15 @@ static int glm_pack_generate(const Options& o) {
             const uint64_t h = sn.hits - multi_st1.hits, m = sn.misses - multi_st1.misses;
             std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
                         "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f "
-                        "active=%zu\n",
+                        "disk_gb=%.1f draft_acc=%llu draft_off=%llu active=%zu\n",
                         n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                         (double) (sn.ram_hits - multi_st1.ram_hits) / n,
                         (double) (sn.disk_reads - multi_st1.disk_reads) / n,
                         (double) (sn.promotions - multi_st1.promotions) / n, (long long) sn.pool_used,
                         (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                        sn.pool_gb, gens.size());
+                        sn.pool_gb, std::max(0.0, sn.all_gb - sn.pool_gb - sn.ram_gb),
+                        (unsigned long long) (model.spec_hits_ - multi_hits0 + multi_mtp_acc),
+                        (unsigned long long) (model.spec_steps_ - multi_spec0 + multi_mtp_off), gens.size());
         }
         for (const int64_t e : eos)
             if (e == tok && stop_on_eos) {
@@ -2776,6 +2791,8 @@ static int glm_pack_generate(const Options& o) {
             g.mtp_steps += 1;
             g.mtp_drafts += (uint64_t) (w.counts[(size_t) i] - 1);
             g.mtp_acc += (uint64_t) (k - 1);
+            multi_mtp_off += (uint64_t) (w.counts[(size_t) i] - 1);
+            multi_mtp_acc += (uint64_t) (k - 1);
             for (int t = 0; t + 1 < k; ++t) written.push_back(wr[(size_t) t]);   // (the tokens at p0 + 1 .. p0 + k - 1)
             last[(size_t) i] = wr[(size_t) k - 1];
             g.drafts.clear();
@@ -3064,6 +3081,9 @@ static int glm_pack_generate(const Options& o) {
             multi_n = 0;
             multi_t1 = g->t1;
             multi_st1 = g->st1;
+            multi_spec0 = g->spec_steps0;
+            multi_hits0 = g->spec_hits0;
+            multi_mtp_acc = multi_mtp_off = 0;
         }
         if (std::strcmp(g->finish, "cancel") == 0) {
             gens.push_back(std::move(g));
@@ -5351,6 +5371,16 @@ int main(int argc, char** argv) {
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const strata::core::ModelGeometry draft_geometry{};
+#if !defined(STRATA_USE_HIP)
+        // an on-demand vision encoder (it runs on the first GPU): a drafter there can lend its experts' VRAM too,
+        // when the expert cache alone cannot hold the encoder (nothing drafts while a picture is read)
+        {
+            int dev0 = 0;
+            cudaGetDevice(&dev0);
+            if (o.serve && o.vision && vision_lend_need() > 0 && (last_st == nullptr || last_st->dev == dev0))
+                mtp.set_lendable(true);
+        }
+#endif
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "maya generate: %s\n", err.c_str()); return 1; }
@@ -5707,6 +5737,11 @@ int main(int argc, char** argv) {
         // STRATA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
         int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
+#if !defined(STRATA_USE_HIP)
+        // an on-demand vision encoder (serve --vision; the server sets STRATA_GLM_VISION_LEND_MB): the cache is mapped
+        // in pieces, so its tail can be given back while a picture is read (HIP: only VRAM that is free is lent)
+        if (o.serve && o.vision && vision_lend_need() > 0) xcache.set_lendable(true);
+#endif
         for (int attempt = 0;; ++attempt) {
             bool ok = false;
             if (fake_fails > 0) {
@@ -7135,6 +7170,7 @@ int main(int argc, char** argv) {
                 }
             };
             while (getline_fd(l)) {
+                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(in_mu);
@@ -7177,6 +7213,50 @@ int main(int argc, char** argv) {
                              (long long) free_mib, (long long) (o.vram_reserve_mib + 512 - free_mib));
             }
         }
+        // The on-demand vision encoder (the server's VLEND / VRECLAIM between requests): it runs on this GPU in the
+        // VRAM that is free, plus - when that is short - the tail of the expert cache, given back to the driver
+        // while the picture is read (its experts are marked not resident) and mapped again and refilled after, so
+        // the next request finds the same experts in the same slots.  Nothing decodes while the encoder runs and a
+        // refill needs no slot (the experts are copied straight from RAM), so the whole cache can be lent; when even
+        // that is short, the draft layer's experts on this GPU follow (read again from their file after).
+        // `vis_cap` (the INFO's vision_lend): the encoder's need when free VRAM plus what can be lent holds it, else
+        // 0 (the server then runs the encoder on the CPU).
+        const uint64_t vis_need = o.vision ? vision_lend_need() : 0;
+        constexpr uint64_t kVisMargin = (uint64_t) 128 << 20;   // VRAM left free beside the encoder
+        const bool vis_tail_ok = xcache.lendable() && !host_res.empty() && d_res != nullptr && srcp != nullptr;
+        constexpr uint64_t vis_keep = 0;   // (no slot is needed while the encoder runs or for the refill)
+        const uint64_t vis_mtp_tail = !o.mtp.empty() ? mtp.lendable_bytes() : 0;
+        uint64_t vis_cap = 0;
+        if (vis_need > 0) {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const uint64_t have = free_b > kVisMargin ? (uint64_t) free_b - kVisMargin : 0;
+            const uint64_t tail = vis_tail_ok ? xcache.lendable_bytes(vis_keep) : 0;
+            if (have >= vis_need) {
+                vis_cap = vis_need;
+                std::fprintf(stderr, "maya serve: pictures: the vision encoder (%.2f GB) runs on this GPU in VRAM "
+                                     "that is free\n", (double) vis_need / 1073741824.0);
+            } else if (have + tail >= vis_need) {
+                vis_cap = vis_need;
+                std::fprintf(stderr, "maya serve: pictures: the vision encoder (%.2f GB) runs on this GPU - %.2f GB "
+                                     "free, the rest lent by the expert cache while a picture is read\n",
+                             (double) vis_need / 1073741824.0, (double) have / 1073741824.0);
+            } else if (have + tail + vis_mtp_tail >= vis_need) {
+                vis_cap = vis_need;
+                std::fprintf(stderr, "maya serve: pictures: the vision encoder (%.2f GB) runs on this GPU - %.2f GB "
+                                     "free, %.2f GB lent by the expert cache and the rest by the draft layer's "
+                                     "experts while a picture is read\n",
+                             (double) vis_need / 1073741824.0, (double) have / 1073741824.0,
+                             (double) tail / 1073741824.0);
+            } else {
+                std::fprintf(stderr, "maya serve: pictures: this GPU cannot spare the %.2f GB the vision encoder "
+                                     "needs (%.2f GB free, %.2f GB the expert cache and %.2f GB the draft layer can "
+                                     "lend%s) - it runs on the CPU\n",
+                             (double) vis_need / 1073741824.0, (double) have / 1073741824.0,
+                             (double) tail / 1073741824.0, (double) vis_mtp_tail / 1073741824.0,
+                             xcache.lendable() ? "" : ": this cache cannot give memory back");
+            }
+        }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -7196,12 +7276,13 @@ int main(int argc, char** argv) {
             // (v1.1.32) the expert tiers, as the GLM engine's INFO names them: the Monitor's "where the experts live"
             const int64_t all_experts = (int64_t) g.n_layers * g.n_expert;
             const int64_t ram_experts = from_gguf ? gguf_src.resident_blobs() : all_experts;
-            std::printf("INFO engine_kind=qwen experts=%lld vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d\n",
+            std::printf("INFO engine_kind=qwen experts=%lld vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d"
+                        " vision_lend=%llu\n",
                         (long long) all_experts, (long long) xcache.slots(), (double) xcache.bytes() / 1073741824.0,
                         (long long) ram_experts,
                         (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
                             1073741824.0,
-                        o.mtp.empty() ? 0 : 1);
+                        o.mtp.empty() ? 0 : 1, (unsigned long long) vis_cap);
         }
         start_serve_watchdog(60);   // one step (a prompt layer, a verify window) takes seconds
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
@@ -7219,6 +7300,62 @@ int main(int argc, char** argv) {
         // h = p + y, w = p + x, and the text after the image continues at p + max(nx, ny).
         constexpr int64_t kImagePad = 248056;   // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells
         bool mrope_identity = true;
+        // the experts the vision encoder's memory took out (residency index, slot), refilled once it is back
+        std::vector<std::pair<int32_t, int32_t>> vis_lent;
+        uint64_t vis_mtp_given = 0;   // the draft layer's expert bytes lent with them
+        auto vis_reclaim_cache = [&](std::string& e) -> bool {
+            if (!xcache.lent()) return true;
+            const auto t0 = Clock::now();
+            if (!xcache.reclaim_tail(e)) return false;
+            uint64_t bytes = 0;
+            bool filled = true;
+            for (const auto& [i, slot] : vis_lent) {   // as after a prompt: queued copies, one wait
+                const int64_t l = i / g.n_expert, ex = i % g.n_expert;
+                const uint8_t* b = srcp->blob(l, ex);
+                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                const bool blocking = refill_blocking() || !srcp->stable(l, ex);
+                if (b == nullptr || !(blocking ? xcache.fill_slot_blocking(slot, b, e, nb)
+                                               : xcache.fill_slot_queued(slot, b, e, nb))) {
+                    filled = false;
+                    break;
+                }
+                bytes += (uint64_t) nb;
+            }
+            if (!xcache.sync_queued(e)) filled = false;
+            if (!filled) {
+                // (those experts stay marked not resident: the answers stay right, the decode is slower)
+                std::fprintf(stderr, "maya serve: refilling the expert cache after the vision encoder failed (%s): "
+                                     "%zu experts are read from RAM until the engine restarts\n", e.c_str(),
+                             vis_lent.size());
+                vis_lent.clear();
+                return true;
+            }
+            for (const auto& [i, slot] : vis_lent) host_res[(size_t) i] = slot;
+            res_upload();
+            std::fprintf(stderr, "maya serve: the vision encoder's VRAM is back: %zu experts (%.2f GB) refilled in "
+                                 "%.0f ms\n", vis_lent.size(), (double) bytes / 1073741824.0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            vis_lent.clear();
+            return true;
+        };
+        // the cache first (its refill is the faster), then the draft layer's experts
+        auto vis_reclaim = [&](std::string& e) -> bool {
+            if (!vis_reclaim_cache(e)) return false;
+            if (!mtp.experts_lent()) return true;
+            const auto t0 = Clock::now();
+            if (!mtp.reclaim_experts(e)) {
+                if (mtp.experts_lent()) return false;   // (the memory is not free yet: a later call maps the rest)
+                // mapped again but not read back: only the drafts suffer (the verify decides every token)
+                std::fprintf(stderr, "maya serve: %s - drafts are rejected until the engine restarts\n", e.c_str());
+                vis_mtp_given = 0;
+                return true;
+            }
+            std::fprintf(stderr, "maya serve: the draft layer's experts are back: %.2f GB read again in %.0f ms\n",
+                         (double) vis_mtp_given / 1073741824.0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            vis_mtp_given = 0;
+            return true;
+        };
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
         // The prompt path's chunk, for the requests that follow: an allocation failure lowers it (the memory is
@@ -7233,6 +7370,93 @@ int main(int argc, char** argv) {
                 ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            // VLEND / VRECLAIM (between requests): the on-demand vision encoder is about to start on this GPU
+            // ("VLENT <bytes taken from the expert cache>"; 0: the free VRAM holds it) - and has ended ("VRECLAIMED";
+            // an ERR while its memory is not free yet: try again)
+            if (line == "VLEND") {
+                std::string ve;
+                uint64_t given = 0, from = 0;
+                if (vis_cap == 0) {
+                    std::printf("ERR this GPU cannot spare the memory the vision encoder needs\n");
+                } else {
+                    apply_pending(true);   // (no swap may still be copying into the slots about to go)
+                    cudaDeviceSynchronize();
+                    size_t free_b = 0, total_b = 0;
+                    cudaMemGetInfo(&free_b, &total_b);
+                    const uint64_t have = free_b > kVisMargin ? (uint64_t) free_b - kVisMargin : 0;
+                    // what is short of the free VRAM: the expert cache's tail first (all of it if need be), then
+                    // the draft layer's experts on this GPU
+                    uint64_t mtp_given = 0;
+                    const uint64_t short_b = have < vis_need ? vis_need - have : 0;
+                    if (short_b > 0 && vis_tail_ok) (void) xcache.lend_tail(short_b, vis_keep, from, given, ve);
+                    if (short_b > given && vis_mtp_tail > 0) {
+                        std::string me;
+                        (void) mtp.lend_experts(short_b - given, mtp_given, me);
+                        vis_mtp_given = mtp_given;
+                        if (!me.empty()) ve = ve.empty() ? me : ve + "; " + me;
+                    }
+                    const bool ok = given + mtp_given >= short_b;
+                    if (!ok) {
+                        char buf[200];
+                        std::snprintf(buf, sizeof buf, "the GPU could give the vision encoder only %.2f of the %.2f GB "
+                                      "it needs", (double) (have + given + mtp_given) / 1073741824.0,
+                                      (double) vis_need / 1073741824.0);
+                        ve = ve.empty() ? std::string(buf) : std::string(buf) + " (" + ve + ")";
+                    }
+                    if (xcache.lent()) {   // (also after a lend that stopped half-way: what is out is marked)
+                        // every slot reaching past `from` has lost its expert until the reclaim refills it
+                        int32_t first = 0;
+                        const uint8_t* base = xcache.device_slot(0);
+                        while (first < (int32_t) xcache.slots() &&
+                               (first + 1 < (int32_t) xcache.slots()
+                                    ? (uint64_t) (xcache.device_slot(first + 1) - base)
+                                    : (uint64_t) xcache.bytes()) <= from)
+                            ++first;
+                        for (size_t i = 0; i < host_res.size(); ++i)
+                            if (host_res[i] >= first && (!multi_gpu || stage_of((int64_t) i / g.n_expert) == 0)) {
+                                vis_lent.emplace_back((int32_t) i, host_res[i]);
+                                host_res[i] = strata::core::kNotResident;
+                            }
+                        res_upload();
+                    }
+                    if (ok) {
+                        cudaMemGetInfo(&free_b, &total_b);   // (measured: what the encoder finds free now)
+                        std::fprintf(stderr, "maya serve: the vision encoder gets %.2f GB of VRAM: %.2f GB free, "
+                                             "%.2f GB from the expert cache (%zu experts out until it ends), %.2f GB "
+                                             "from the draft layer's experts - %.2f GB free now\n",
+                                     (double) vis_need / 1073741824.0, (double) std::min(have, vis_need) / 1073741824.0,
+                                     (double) given / 1073741824.0, vis_lent.size(),
+                                     (double) mtp_given / 1073741824.0, (double) free_b / 1073741824.0);
+                        std::printf("VLENT %llu\n", (unsigned long long) (given + mtp_given));
+                    } else {
+                        std::printf("ERR %s\n", ve.c_str());
+                    }
+                }
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "VRECLAIM") {
+                std::string ve;
+                if (vis_reclaim(ve)) std::printf("VRECLAIMED\n");
+                else std::printf("ERR %s\n", ve.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            if (xcache.lent() || mtp.experts_lent()) {
+                // a request while the encoder's memory is still out (the server reclaims it first, so only when
+                // that kept failing): it is taken back first - the prompt path's buffers live in that tail
+                std::string ve;
+                bool back = false;
+                for (int i = 0; i < 120 && !(back = vis_reclaim(ve)); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    strata::core::progress_beat();
+                }
+                if (!back) {
+                    std::printf("ERR the GPU memory lent to the vision encoder is not free yet (%s)\n", ve.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+            }
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -7766,6 +7990,9 @@ int main(int argc, char** argv) {
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t draft_offered = 0, draft_accepted = 0;
+            // (the Monitor's "where the experts live": every routed expert in GB, and the RAM tier's share)
+            const double qwen_ram_gb = (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) / 1073741824.0;
+            const double qwen_all_gb = from_gguf ? (double) gguf_src.all_bytes() / 1073741824.0 : qwen_ram_gb;
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
@@ -7901,7 +8128,8 @@ int main(int argc, char** argv) {
                     const int64_t look = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - decode_look0;
                     const int64_t staged = from_gguf ? gguf_src.staged() - staged0 : 0;
                     std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=0 "
-                                "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f\n",
+                                "vram_used=%lld vram_slots=%lld ram_used=%lld ram_gb=%.1f vram_gb=%.1f "
+                                "disk_gb=%.1f draft_acc=%lld draft_off=%lld\n",
                                 nt / std::max(1e-9, el), 1000.0 * el / nt, (double) h / (double) std::max<int64_t>(1, look),
                                 (double) std::max<int64_t>(0, look - h - staged) / nt, (double) staged / nt,
                                 (long long) xcache.resident(), (long long) xcache.slots(),
@@ -7909,7 +8137,9 @@ int main(int argc, char** argv) {
                                                        : (int64_t) g.n_layers * g.n_expert - xcache.resident()),
                                 (double) (from_gguf ? gguf_src.resident_bytes() : strata::kernels::cpu::expert_layout().total) /
                                     1073741824.0,
-                                (double) xcache.bytes() / 1073741824.0);
+                                (double) xcache.bytes() / 1073741824.0,
+                                std::max(0.0, qwen_all_gb - (double) xcache.bytes() / 1073741824.0 - qwen_ram_gb),
+                                (long long) draft_accepted, (long long) draft_offered);
                 }
                 std::fflush(stdout);
                 ++rounds;

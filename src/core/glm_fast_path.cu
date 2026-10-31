@@ -24,6 +24,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
+#include "strata/platform/idle_gate.hpp"
 
 #include "ggml.h"
 
@@ -1897,6 +1898,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             prefill_settle(all > 0 ? std::min(1.0, held / all) : 1.0);
         }
+        for (int il = l0_; il < lt_; ++il)
+            if (F->L[(size_t) il].moe) F->all_bytes += (size_t) g.n_expert * (size_t) F->lp[(size_t) il].stride;
         F->upd_at.assign((size_t) (2 * F->n_keys + NL * gf::kSpares), 0);
         F->upd_gen.assign(F->upd_at.size(), 0u);
         // disk reads: three slices per expert in parallel, through the staging above when the RAM tier has no free slot
@@ -4254,6 +4257,7 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         s.pool_slots += F->pool_slots;
         s.pool_gb += (double) F->pool_bytes / 1073741824.0;
         s.ram_gb += (double) F->ram_bytes / 1073741824.0;
+        s.all_gb += (double) F->all_bytes / 1073741824.0;
         for (const auto& P : F->lp)
             for (char c : P.st) s.pool_used += c == FastState::kResident;
         for (const auto& R : F->rc) {
@@ -4326,13 +4330,21 @@ void Glm5Model::fast_service() {
     // system then lacked, and the server's stall watchdog could never see a stuck engine as idle.  A decode's routes
     // come ~1 ms apart (two GPUs: half a token between a card's routes), so it spins all through one.  After
     // STRATA_GLM_SERVICE_IDLE_MS (200; 0 = spin always) without a route it polls every 0.1 ms (Windows' timer: 1 ms),
-    // after 10x that every 2 ms - the first route after a quiet spell is answered up to one sleep later
+    // after 10x that every 2 ms - the first route after a quiet spell is answered up to one sleep later.  After
+    // STRATA_GLM_SERVICE_DEEP_S (60; 0 = never) of quiet - a server nobody is talking to - it sleeps on the idle gate
+    // for STRATA_GLM_SERVICE_DEEP_MS (100) at a time, ~10 wakeups a second instead of 500 (a core's worth of timer
+    // interrupts a GPU on a quiet machine, issue #685); the thread that reads the engine's input pokes the gate at
+    // each line, so the next request's first route finds the thread awake (strata/platform/idle_gate.hpp)
     static const int kIdleMs = [] {
         const char* v = getenv("STRATA_GLM_SERVICE_IDLE_MS");
         return v ? std::max(0, std::atoi(v)) : 200;
     }();
+    static const int kDeepS = strata::platform::idle_env("STRATA_GLM_SERVICE_DEEP_S", 60);
+    static const int kDeepMs = std::max(1, strata::platform::idle_env("STRATA_GLM_SERVICE_DEEP_MS", 100));
+    strata::platform::IdleGate& gate = strata::platform::idle_gate();
+    uint64_t gate_seen = 0;
     auto last_route = std::chrono::steady_clock::now();
-    int idle = 0;                        // 0 spinning, 1 short sleeps, 2 long sleeps
+    int idle = 0;                        // 0 spinning, 1 short sleeps, 2 long sleeps, 3 the idle gate
     // a batched verify window's layer with two window lanes: its routes held until the layer's last token routed,
     // then answered together (win_cpu_merged; STRATA_GLM_WIN_CPU=0: each token to a lane as its route comes)
     static const bool win_merge = [] {
@@ -4354,6 +4366,7 @@ void Glm5Model::fast_service() {
     unsigned int kick_polls = 0;
 #endif
     while (!F->quit.load(std::memory_order_relaxed)) {
+        if (idle == 3) gate_seen = gate.epoch();   // (before the look at the ring: a poke after it ends the sleep at once)
         gf::MoeRequest* rq = F->ring_h + (next % gf::kRingSize);
         const unsigned int sq = rq->seq;
         if (sq != next) {
@@ -4380,8 +4393,17 @@ void Glm5Model::fast_service() {
                     }
                 }
 #endif
-                if (idle == 2) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                if (idle == 3) {
+                    if (gate.sleep(kDeepMs, gate_seen)) {   // the engine was written to: awake, as after a route
+                        idle = 0;
+                        polls = 0;
+                        last_route = std::chrono::steady_clock::now();
+                    }
+                } else if (idle == 2) {
+                    if (kDeepS > 0 && std::chrono::steady_clock::now() - last_route > std::chrono::seconds(kDeepS))
+                        idle = 3;
+                    else
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 } else if (idle == 1) {
 #ifdef _WIN32
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));

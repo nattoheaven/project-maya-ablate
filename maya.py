@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or Qwen-3.8-Flash-Next
-(CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, text only.
+(CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, pictures too.
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
 validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash only, text only,
 one conversation at a time.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
@@ -41,7 +41,7 @@ no tuning step - it balances its own split):
      and the size - and starts only after you answer y (or pass --download-model)
   6. builds the pack (the engine's index of the model files) inside the model folder
   7. images: compiles the vision encoder (`build-vision/bin/maya-vision`) and fetches the model's vision files
-     (1.1 GB, shown and asked first like the model; --no-vision and HIP skip it)
+     (1.1 GB, shown and asked first like the model; --no-vision skips it)
   8. writes maya-<model>.json and run-maya-<model>.sh (.bat on Windows) - with the settings tuned for this PC
      earlier, or it offers the tuning (./maya.sh --calibrate does it any time) - and starts the dashboard on
      http://127.0.0.1:8080
@@ -538,7 +538,6 @@ DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
 DS4_MANIFEST = ROOT / "tools" / "ds4" / "download.json"
 DS4_PACK_TOOLS = ("tools/ds4/pack.py", "tools/ds4/engram_hash.py", "tools/ds4/st.py", "tools/ds4/chat_template.jinja")
 DS4_MIN_CC = 70                                    # (V100 on: the experts' kernels before sm_80 since v1.1.20)
-DS4_VISION_MIN_CC = 80                             # the vision tower's BF16 GEMMs: RTX 30 / A100 or newer
 # ... or unsloth's GGUFs (tools/ds4/download_gguf.json, packed by tools/ds4/pack_gguf.py): dense weights BF16 (UD-Q8_K_XL)
 # or Q8_0 (UD-Q4_K_XL), routed experts MXFP4, read in place - the experts VRAM does not hold come from RAM or, through
 # the OS page cache, from the SSD, so it runs whatever the memory; Volta or newer.  The DSpark drafter and the vision
@@ -551,11 +550,19 @@ DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
 DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
               "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
-              "abliterated-256g": "Mix-256G"}
+              "abliterated-256g": "Mix-256G", "gguf-iq1_s": "UD-IQ1_S", "gguf-iq1_m": "UD-IQ1_M",
+              "gguf-iq2_xxs": "UD-IQ2_XXS", "gguf-q2_k_xl": "UD-Q2_K_XL", "gguf-iq3_xxs": "UD-IQ3_XXS",
+              "gguf-iq3_s": "UD-IQ3_S", "gguf-q3_k_xl": "UD-Q3_K_XL"}
 DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
 # unsloth's UD-Q4_K_XL is no longer in the setup's list (the owner, v1.1.34): --ds4-quant gguf-q4 and an install of it
 # work as before; the list shows it only on a PC that has it set up
 DS4_BY_HAND = ("gguf-q4",)
+# unsloth's smaller UD quants (its re-upload of 2026-10-28, each pinned to that revision in download_gguf.json): the
+# experts 1.6-3.5 bits by layer, the dense weights Q5_K - BF16, the Engram tables in the last shard (IQ4_NL, Q5_K,
+# Q6_K or MXFP8; read from the SSD as every quant's).  --ds4-quant names one; as UD-Q4_K_XL, the list shows one only on
+# a PC that has it set up - but for DS4_UD_LISTED, which the list always shows
+DS4_UD = ("gguf-iq1_s", "gguf-iq1_m", "gguf-iq2_xxs", "gguf-q2_k_xl", "gguf-iq3_xxs", "gguf-iq3_s", "gguf-q3_k_xl")
+DS4_UD_LISTED = ("gguf-iq3_s",)   # (UD-IQ3_S: close to Q8's quality; listed between Maya-S and the Q8, the owner, v1.1.43)
 # ... and orcarouter's abliterated model (its refusals removed from the weights) as GGUFs (download_gguf.json's
 # "abliterated": Mix-128G and Mix-256G, the experts in other low-bit types layer by layer; a gated repo, so its download
 # sends the user's Hugging Face token), in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/<version>, served under a
@@ -662,7 +669,8 @@ MM3_GGUF_MIN_CC = 70                               # (maya-ds4's GGUF kernels' r
 # GatedDeltaNet and sparse-attention layers; hyper-connections; an n-gram table; an MTP block) in peasantsmith's one
 # GGUF (tools/qwen/download.json: pinned, sha256-checked).  It runs on the `maya` engine's own Qwen path from the file
 # in place: the experts in VRAM, the next-most-used in RAM as far as this PC's RAM goes, the rest read from the SSD; the
-# 52 GB n-gram table read from the SSD row by row (never in RAM).  Text only (no vision tower in its repo).  Its chat
+# 52 GB n-gram table read from the SSD row by row (never in RAM).  Pictures: the base model's vision tower (the fine-tune
+# kept it byte for byte) as llama.cpp's mmproj, read by maya-vision when a picture arrives (download.json's "vision").  Its chat
 # template is the GGUF's (thinking always on, reasoning effort low / medium / xhigh; Qwen's XML tool calls); sampling
 # its card's (general.sampling: temperature 1.0, top-p 0.95, top-k 20).  The MTP drafter is built from the GGUF's
 # NextN block (tools/mtp_from_gguf.py) and kept where it measures faster on this PC.
@@ -1976,11 +1984,10 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
     return (nvccs[0] if nvccs else nvcc_given), hc_given
 
 
-def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
+def hip_toolchain(pc: dict) -> tuple:
+    """(ROCm root, its clang++, its bin folder, the build's environment) for a HIP build - the engine's and, on
+    Windows, the vision encoder's (#345)."""
     root = Path(pc["rocm"])
-    cmake = pick_cmake()
-    if not cmake:
-        fail("CMake 3.24 or newer is needed")
     clang = hip_clang(root) or root / "llvm/bin/clang++"
     bindir = Path(pc.get("rocm_bin") or root / "bin")
     env = dict(os.environ, HIP_PLATFORM="amd", HIP_COMPILER="clang", HIP_RUNTIME="rocclr",
@@ -1991,6 +1998,28 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         env["LD_LIBRARY_PATH"] = os.pathsep.join(libs + [env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
     # Keep compiler-cache writes inside this project, including when run in a workspace sandbox.
     env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
+    if WIN:
+        env["HIP_DEVICE_LIB_PATH"] = str(clang.parent.parent / "amdgcn" / "bitcode")
+    return root, clang, bindir, env
+
+
+def copy_hip_dlls(bindir: Path, dest: Path) -> None:
+    # Windows takes a program's DLLs from its own folder, then System32 - where AMD's driver puts its own HIP
+    # runtime - and PATH only after: the runtime the program was built with goes next to it (as llama.cpp's
+    # Windows builds do; with the driver's, cudaMemGetInfo failed there)
+    for pattern in ("amdhip64*.dll", "amd_comgr*.dll", "rocm_kpack*.dll"):
+        for dll in bindir.glob(pattern):
+            try:
+                shutil.copy2(dll, dest)
+            except OSError as e:                   # (in use: a program still running keeps the one it has)
+                warn(f"could not copy {dll.name} next to {dest} ({e})")
+
+
+def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
+    cmake = pick_cmake()
+    if not cmake:
+        fail("CMake 3.24 or newer is needed")
+    root, clang, bindir, env = hip_toolchain(pc)
     conf = [cmake]
     if WIN:
         # as tools\hip\build_maya_windows.bat, which built it on Windows (#54): ROCm's clang for the host code too, in
@@ -1998,8 +2027,7 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         ninja = venv_tool("ninja") or shutil.which("ninja")
         if not ninja:
             fail("Ninja is needed to compile the HIP engine on Windows", f"run {ME} --setup again (pip puts it into .venv)")
-        bitcode = clang.parent.parent / "amdgcn" / "bitcode"
-        env["HIP_DEVICE_LIB_PATH"] = str(bitcode)
+        bitcode = Path(env["HIP_DEVICE_LIB_PATH"])
         conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={Path(ninja).as_posix()}",
                  f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
                  f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}",
@@ -2025,15 +2053,7 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
         fail("the HIP engine build failed", "see the compiler output above" +
              (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
     if WIN:
-        # Windows takes a program's DLLs from its own folder, then System32 - where AMD's driver puts its own HIP
-        # runtime - and PATH only after: the runtime the engine was built with goes next to it (as llama.cpp's
-        # Windows builds do; with the driver's, cudaMemGetInfo failed there). lib_dirs keeps the libraries
-        for pattern in ("amdhip64*.dll", "amd_comgr*.dll", "rocm_kpack*.dll"):
-            for dll in bindir.glob(pattern):
-                try:
-                    shutil.copy2(dll, EXE.parent)
-                except OSError as e:                   # (in use: an engine still running keeps the one it has)
-                    warn(f"could not copy {dll.name} next to the engine ({e})")
+        copy_hip_dlls(bindir, EXE.parent)              # (lib_dirs keeps the libraries)
     old = read_json(STAMP)   # (the targets compiled from this source: a GLM-5.3-Flash and a DeepSeek setup share it)
     same = old.get("backend") == "hip" and old.get("src") == src and old.get("archs") == pc["archs"]
     meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
@@ -2535,6 +2555,40 @@ def fetch_files(m: dict, shards: list, missing: list, urls: dict) -> None:
         S.progress()
 
 
+def disk_of(path: Path):
+    """An id of the disk path is on (its st_dev)."""
+    return os.stat(path).st_dev
+
+
+def linked_downloads(m: dict, d: Path, missing: list) -> dict:
+    """The part of a download that lands on another disk than d's: a shard that is a link (a symlink, on Windows too)
+    to a file on that disk is written there, not into d.  {the folder it lands in: (GB free on that disk, GB still to
+    download into it)}; only for the GGUFs whose shard sizes the manifest lists (m["files"])."""
+    out: dict = {}
+    if "files" not in m:
+        return out
+    try:
+        home = disk_of(existing(d))
+    except OSError:
+        return out
+    for s in missing:
+        if not s.is_symlink():
+            continue
+        try:
+            target = Path(os.path.realpath(s))
+            where = existing(target.parent)
+            if disk_of(where) == home:
+                continue
+            have = target.stat().st_size if target.exists() else 0
+            need = max(0, m["files"].get(hf_name(m, s), 0) - have) / 1e9
+            free = shutil.disk_usage(where).free / 1e9
+        except (OSError, KeyError):
+            continue
+        prev = out.get(str(where), (free, 0.0))
+        out[str(where)] = (free, prev[1] + need)
+    return out
+
+
 def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) -> bool:
     """Shows what would be downloaded - the source, the size, the exact commands - and downloads only after a yes
     (or --download-model).  False: nothing was downloaded."""
@@ -2566,11 +2620,19 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
     also = float(m.get("also_gb") or 0)   # (what the setup downloads after it, beside it: the space for both)
     if also:
         say(f"  Then {m.get('also_what', 'more files')}: {also:.0f} GB more.")
-    if free < remaining + also + 3:
-        fail(f"not enough free space in {d}: about {remaining + also + 3:.0f} GB are needed (the model" +
+    linked = linked_downloads(m, d, missing)   # (a shard that is a link to another disk lands on that disk)
+    here = remaining - sum(need for _, need in linked.values())
+    for where, (gb_free, need) in linked.items():
+        say(f"    {need:.0f} GB of it, linked from there, into {where}   ({gb_free:.0f} GB free)")
+    if free < here + also + 3:
+        fail(f"not enough free space in {d}: about {here + also + 3:.0f} GB are needed (the model" +
              (f", {m.get('also_what', 'more files')}" if also else "") + " + its pack)",
              f"free some space, or put the model on another drive: {ME} --setup --models-dir " +
              (r"D:\Maya-models" if WIN else "/path/on/nvme"))
+    for where, (gb_free, need) in linked.items():
+        if gb_free < need + 3:
+            fail(f"not enough free space in {where}: about {need + 3:.0f} GB of the model are linked into it from {d}",
+                 "free some space there, or link the files to another drive")
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: the engine reads experts from these files while it answers - use an "
              "NVMe SSD (--models-dir)")
@@ -2940,23 +3002,45 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     archs = meta.get("archs") or pc.get("archs") or []
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
              f"-DLLAMA_DIR={llama}"]
-    if not metal:                                      # (macOS: ggml builds its Metal backend by default, no CUDA)
+    hip = pc.get("backend") == "hip"
+    env = vcvars = bindir = None
+    if hip:
+        conf += ["-DSTRATA_VISION_HIP=ON",
+                 "-DSTRATA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
+                 "-DAMDGPU_TARGETS=" + ";".join(str(x) for x in archs),
+                 "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(str(x) for x in archs)]
+        if WIN:
+            # ggml's HIP backend compiles its kernels as C++ on Windows (CMake has no HIP language there): ROCm's
+            # clang for C and C++, in Visual Studio's environment, as the engine (compile_engine_hip)
+            root, clang, bindir, env = hip_toolchain(pc)
+            conf += [f"-DCMAKE_C_COMPILER={(clang.parent / 'clang.exe').as_posix()}",
+                     f"-DCMAKE_CXX_COMPILER={clang.as_posix()}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}"]
+            vcvars = S.find_vcvars(cuda=False)
+        else:
+            conf.append("-DCMAKE_EXE_LINKER_FLAGS=-no-pie")
+        if S.ARM and S.arm_cpu_arch():
+            conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
+    elif not metal:                                    # (macOS: ggml builds its Metal backend by default, no CUDA)
         conf += ["-DSTRATA_VISION_CUDA=ON",
                  "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
                  f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
                  *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
         if S.ARM and S.arm_cpu_arch():
             conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
-    if meta.get("host_compiler") and not metal:
+    if meta.get("host_compiler") and not metal and not hip:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
-        ("Metal backend: a minute or two" if metal else "CUDA kernels: 10-20 minutes") + ", once) ...")
+        ("Metal backend: a minute or two" if metal else ("HIP" if hip else "CUDA") + " kernels: 10-20 minutes") +
+        ", once) ...")
     if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)],
-                   dict(os.environ) if metal else None, "" if metal else "build-maya-vision.bat",
-                   nvcc=None if metal else meta.get("nvcc") or pc["nvcc"]):
+                   dict(os.environ) if metal else env, "" if metal else "build-maya-vision.bat", vcvars=vcvars,
+                   nvcc=None if metal or hip else meta.get("nvcc") or pc["nvcc"]):
         return False
+    if bindir is not None and VEXE.exists():
+        copy_hip_dlls(bindir, VEXE.parent)
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
+                                  "backend": pc.get("backend"),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
     return VEXE.exists()
 
@@ -2967,9 +3051,6 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     first start how much that is on this GPU (serve/server.py, vision_footprint).  On a Mac (Metal: one memory, no
     lending) it stays resident beside the model."""
     step(7, "images (the vision encoder)")
-    if pc.get("backend") == "hip":
-        ok("HIP port: text only; vision is not enabled")
-        return None
     # a GGUF of your own reads pictures with the same files: the vision tower and the tokenizer are the same in
     # every GLM-5.3-Flash quant
     spec = MODELS.get(quant) or MODELS[next(iter(MODELS))]
@@ -3653,6 +3734,35 @@ def parallel_of(cfg: dict) -> int:
     return int(v) if str(v).isdigit() else 1
 
 
+def unattended_start(a) -> str | None:
+    """Why this start has nobody to wait for it, else None: --yes, no terminal on stdin (a service, a pipe), or a
+    systemd unit (INVOCATION_ID / NOTIFY_SOCKET).  An unattended start never runs a calibration by itself: it loads the
+    model two more times, and a service manager that kills the start after its timeout would repeat that forever (#690)."""
+    if getattr(a, "yes", False):
+        return "--yes"
+    if os.environ.get("INVOCATION_ID") or os.environ.get("NOTIFY_SOCKET"):
+        return "started by systemd"
+    try:
+        if not sys.stdin.isatty():
+            return "no terminal"
+    except (AttributeError, ValueError, OSError):      # (stdin closed or replaced)
+        return "no terminal"
+    return None
+
+
+def skip_start_calibrations(cfg_path: Path, cfg: dict, why: str) -> None:
+    """The one line an unattended start prints instead of measuring: what is skipped, and the command to run later."""
+    todo = []
+    if needs_prefill_calibration(cfg):
+        todo.append(("prefill calibration", "--calibrate"))
+    if needs_speed_calibration(cfg):
+        todo.append(("speed calibration", "--speed-calibration"))
+    if todo:
+        say("  Calibration skipped on this start (" + why + "): the model starts with its default settings. Run it once "
+            "when you can wait for it: " + "; ".join(f"{ME} --config {cfg_path} {flag} --no-start ({name})"
+                                                      for name, flag in todo))
+
+
 def needs_speed_calibration(cfg: dict) -> bool:
     """A config that drafts with DFlash2 but has no speed calibration yet (set up before there was one, or its
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
@@ -3975,11 +4085,14 @@ def server_command(cfg_path: Path, a) -> tuple:
         ok(f"{cfg_path.name}: starts from DeepSeek's shipped expert profile ({DS4_PROFILE.name}, copied into the pack)")
     cfg_path.touch()                                   # the most recently used model
     refresh_engine(cfg)
-    if needs_prefill_calibration(cfg):                 # MiniMax set up before the prefill calibration: measured once
+    unattended = unattended_start(a)
+    if unattended:                                     # nobody to wait: no calibration (it loads the model two more times)
+        skip_start_calibrations(cfg_path, cfg, unattended)
+    if not unattended and needs_prefill_calibration(cfg):   # MiniMax set up before the prefill calibration: measured once
         prefill_calibration(cfg_path, "once, for a setup from before it")
         cfg = read_json(cfg_path)
         args = cfg.get("args") or []
-    if needs_speed_calibration(cfg):                   # a drafter set up without its speed calibration: measured once
+    if not unattended and needs_speed_calibration(cfg):     # a drafter set up without its speed calibration: measured once
         drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
             config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
@@ -4668,9 +4781,10 @@ def ds4_gguf_model(quant: str) -> dict:
         q = (man.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
             fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
-        about, repo, revision = (f"{DS4} as unsloth's {DS4_QUANTS[quant]} GGUF (dense weights "
-                                 f"{'BF16' if quant == 'gguf-q8' else 'Q8_0'}, experts MXFP4, the Engram tables MXFP8)",
-                                 man["repo"], man["revision"])
+        about, repo, revision = (f"{DS4} as unsloth's {DS4_QUANTS[quant]} GGUF ("
+                                 + (q.get("about") or f"dense weights {'BF16' if quant == 'gguf-q8' else 'Q8_0'}, "
+                                                      "experts MXFP4, the Engram tables MXFP8") + ")",
+                                 man["repo"], q.get("revision") or man["revision"])   # (DS4_UD: their own revision)
 
     def form(files: dict, rev: str) -> dict:
         files = {Path(k).name: v for k, v in files.items()}
@@ -4800,13 +4914,21 @@ def ds4_drafter_step(a, d: Path, quant: str | None = None) -> bool:
     return True
 
 
-def ds4_vision_model() -> dict:
+def ds4_vision_model(mmproj: bool = False) -> dict:
     """DeepSeek's vision tower (the GGUFs leave it out; every GGUF of the model shares it) as offer_download's form:
     shard 1 of DeepSeek's own checkpoint (only the tower and its aligner) and config.json (download_gguf.json's
-    "vision"; its "marks" - 30 KB of shard 2 - are read by tools/ds4/vision_pack.py)."""
+    "vision"; its "marks" - 30 KB of shard 2 - are read by tools/ds4/vision_pack.py).  mmproj (unsloth's UD quants):
+    unsloth's mmproj-BF16.gguf from the quant's own repo instead ("vision" / "mmproj": the same weights, vision_pack.py
+    --mmproj makes the same vision.bin from it, byte for byte)."""
     man = (read_json(DS4_GGUF_MANIFEST).get("vision") or {})
     if not man.get("files") or not man.get("marks"):
         fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+    mp = man.get("mmproj") or {}
+    if mmproj and mp.get("files"):
+        return {"about": "DeepSeek's vision tower (it lets the model read pictures), unsloth's mmproj of it",
+                "format": "ds4-vision", "repo": mp["repo"], "revision": mp["revision"], "folder": "", "mmproj": True,
+                "files": {k: v[0] for k, v in mp["files"].items()}, "sha256": {k: v[1] for k, v in mp["files"].items()},
+                "download_gb": sum(v[0] for v in mp["files"].values()) / 1e9}
     return {"about": "DeepSeek's vision tower (it lets the model read pictures), from DeepSeek's own checkpoint",
             "format": "ds4-vision", "repo": man["repo"], "revision": man["revision"], "folder": "",
             "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
@@ -4838,18 +4960,20 @@ def ds4_vision_blocker(pc: dict) -> str | None:
     return None
 
 
-def ds4_vision_step(a, pc: dict, d: Path) -> bool:
+def ds4_vision_step(a, pc: dict, d: Path, mmproj: bool = False) -> bool:
     """Step 7 for a GGUF: the vision tower in ds4_vision_dir(d) - downloaded when it is not there (shard 1 of
     DeepSeek's checkpoint, 0.97 GB, and its config.json), then made the GGUF path's file (tools/ds4/vision_pack.py:
     vision.bin, with the picture markers read from shard 2 by a 30 KB range request); the shard is removed after
-    that.  False: no vision tower (skipped, cannot run here, or not downloaded): the model reads text only."""
+    that.  mmproj (unsloth's UD quants): unsloth's mmproj-BF16.gguf (0.97 GB) instead, made into the same vision.bin.
+    False: no vision tower (skipped, cannot run here, or not downloaded): the model reads text only."""
     step(7, "images (the vision tower)")
     if a.no_vision:
         ok("skipped (--no-vision): the model reads text only")
         return False
     why = ds4_vision_blocker(pc)
     if why:
-        ok(f"{why}: the model reads text only")
+        warn(f"{why}: the model reads text only - the vision tower's weights (~1 GB) are held in pinned RAM while the "
+             f"model runs; with 16 GB of RAM or more {ME} --setup turns pictures on")
         return False
     v = ds4_vision_dir(d)
     if (v / "vision.bin").is_file() and (v / "vision.json").is_file():
@@ -4859,7 +4983,7 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
     if not os.access(existing(v), os.W_OK):
         warn(f"{existing(v)} is not writable: no vision tower, the model reads text only")
         return False
-    m = ds4_vision_model()
+    m = ds4_vision_model(mmproj)
     files = [v / n for n in m["files"]]
     if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the vision tower", v, files, m):
         warn("the vision tower was not downloaded: the model reads text only")
@@ -4868,9 +4992,13 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
         if not sha256_checked(f, m["sha256"][f.name]):
             f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
             fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
-    say("  Reading the picture markers (30 KB of DeepSeek's shard 2, a range request) and copying the tower into one "
-        "file (exactly the same values; a few seconds) ...")
-    r = run([sys.executable, str(ROOT / "tools" / "ds4" / "vision_pack.py"), "--dir", str(v)], check=False)
+    if m.get("mmproj"):
+        say("  Copying the mmproj's tower into one file (exactly the same values; a few seconds) ...")
+    else:
+        say("  Reading the picture markers (30 KB of DeepSeek's shard 2, a range request) and copying the tower into one "
+            "file (exactly the same values; a few seconds) ...")
+    r = run([sys.executable, str(ROOT / "tools" / "ds4" / "vision_pack.py"), "--dir", str(v)]
+            + (["--mmproj", str(files[0])] if m.get("mmproj") else []), check=False)
     if r.returncode != 0 or not (v / "vision.bin").is_file():
         warn("the vision tower was not made (the reason is above): the model reads text only - the setup tries again "
              "next time, without downloading the shard again")
@@ -4897,11 +5025,12 @@ def choose_ds4_quant(a, prev: dict) -> str:
         ccs = []
     exl3_ok = hip or not ccs or max(ccs) >= DS4_MIN_CC
     before = (prev.get("installer") or {}).get("ds4_quant")
-    keys = maya + list(DS4_ABL) + [k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL and (exl3_ok or k not in DS4_EXL3)
-                                   and (k not in DS4_BY_HAND or k == before)]   # (a chosen-by-hand one: only where it is installed)
+    keys = maya + list(DS4_ABL) + list(DS4_UD_LISTED) + [
+        k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL + DS4_UD_LISTED and (exl3_ok or k not in DS4_EXL3)
+                                   and (k not in DS4_BY_HAND + DS4_UD or k == before)]   # (a chosen-by-hand one: only where it is installed)
     abl = ds4_abl_recommended(hip)
     default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
-    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL if k in keys]}
+    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL + DS4_UD if k in keys]}
     for k in DS4_ABL:   # (as the other entries: the whole download, Maya's n-gram tables with it)
         gb[k] += ds4_abl_engram_gb()
     gb.update({"gguf-q8": 508, "gguf-q4": 501, "exl3": 414})
@@ -4922,6 +5051,12 @@ def choose_ds4_quant(a, prev: dict) -> str:
                                  "IQ3_XXS / IQ3_S / MXFP4), ~236 GB of VRAM + RAM hold it; its 161 GB of n-gram tables are "
                                  "Maya's, shared with Maya's DeepSeek quants (downloaded once); a gated repo: your "
                                  "Hugging Face token"}
+    for k in DS4_UD:   # (download_gguf.json's own words: the experts' and dense weights' types, the tables')
+        q = ((read_json(DS4_GGUF_MANIFEST).get("quants") or {}).get(DS4_QUANTS[k]) or {})
+        about[k] = f"unsloth's GGUF: {q.get('about', 'experts in 1.6-3.5 bits')}; ~{q.get('memory_gb', '?')} GB of VRAM + RAM hold it"
+    about["gguf-iq3_s"] = ("unsloth's UD-IQ3_S: close to Q8's quality (KLD 0.061 vs Q8's 0.047; Maya-S 0.119), about 262 GB of "
+                           "VRAM + RAM plus the 161 GB n-gram tables read from the SSD; for PCs with about 270 GB or more of "
+                           "VRAM + RAM - below that it reads experts from the disk and gets slow")
     label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
@@ -5054,6 +5189,102 @@ def ds4_abl_engram_step(a, d: Path, models: Path) -> Path | None:
     return e
 
 
+def ds4_shared_tables(quant: str, d: Path, models: Path, m: dict) -> dict | None:
+    """One copy of the Q6_K n-gram (Engram) tables for unsloth's UD-IQ3_S and Maya's quants, whichever is on the disk
+    first (download_gguf.json: unsloth's table shard holds the same bytes as Maya's pair of shards, compared in full;
+    "tables_as_maya").  Only when the other side's files are whole, by size AND sha256 (never assumed): a UD quant is
+    then set up without its table shard (the Maya pair is read), a Maya quant without its pair (unsloth's shard is
+    read).  None: nothing to share.  Else {"model": m without the files left out, "without": their names, "src":
+    {name: path} of the copy to read, "folder": where the pack reads it from, "what": a sentence for the user}."""
+    man = read_json(DS4_GGUF_MANIFEST)
+    pairs = {t: [Path(n).name for n in names] for t, names in ((man.get("abliterated") or {}).get("engram") or {})
+             .get("from", {}).items()}
+    uds = {k: v for k, v in (man.get("quants") or {}).items() if v.get("tables_as_maya")}
+
+    told = []
+
+    def whole(path: Path, size: int, sha: str) -> bool:
+        try:
+            if path.is_file() and path.stat().st_size == size and not told:
+                told.append(1)
+                say("  The other model's n-gram (Engram) tables are on this disk: checking they are the same bytes "
+                    "(sha256, read once - a few minutes), so that there is one copy of them ...")
+            return path.is_file() and path.stat().st_size == size and sha256_checked(path, sha)
+        except OSError:
+            return False
+
+    def trimmed(names: list) -> dict:
+        files = {k: v for k, v in m["files"].items() if k not in names}
+        return dict(m, files=files, sha256={k: v for k, v in m["sha256"].items() if k in files},
+                    download_gb=sum(files.values()) / 1e9)
+    mine = DS4_QUANTS[quant]
+    if mine in uds:                                      # unsloth's quant, Maya's pair there?
+        table = Path(uds[mine]["table"]).name
+        if table not in m["files"] or not pairs:
+            return None
+        for tier, names in pairs.items():
+            q = ((man.get("maya") or {}).get("quants") or {}).get(tier, {}).get("files") or {}
+            full = {Path(n).name: v for n, v in q.items() if Path(n).name in names}
+            for where in (models / f"{DS4}-Maya-GGUF" / tier, d.parent / "Engram-Q6_K"):   # (Maya's folder first: its
+                # files were checked there, a rerun does not read the 161 GB again through the link)
+                if len(full) == len(names) and all(whole(where / n, v[0], v[1]) for n, v in full.items()):
+                    return {"model": trimmed([table]), "without": [table], "src": {n: where / n for n in full},
+                            "folder": d.parent / "Engram-Q6_K",
+                            "what": f"Maya's Q6_K n-gram tables ({tier}'s pair of shards, {where}) are read for "
+                                    f"{mine}'s too: its own table shard ({table}) is left out"}
+        return None
+    tier = mine                                          # a Maya quant, unsloth's shard there?
+    names = pairs.get(tier)
+    if not names or not all(n in m["files"] for n in names):
+        return None
+    if all(whole(d / n, m["files"][n], m["sha256"][n]) for n in names):
+        return None                                      # (its own pair is there already)
+    for ud, v in uds.items():
+        table = Path(v["table"]).name
+        want = {Path(n).name: x for n, x in v["files"].items()}[table]
+        where = models / f"{DS4}-GGUF" / ud
+        if whole(where / table, want[0], want[1]):
+            return {"model": trimmed(names), "without": names, "src": {table: where / table},
+                    "folder": d.parent / "Engram-UD-Q6_K",
+                    "what": f"unsloth's {ud} table shard ({where / table}) holds the same Q6_K n-gram tables as "
+                            f"{tier}'s pair of shards: read for {tier} too, the pair is left out"}
+    return None
+
+
+def share_file(src: Path, dst: Path) -> str:
+    """dst as src's one copy: already there, else a hard link (same disk), else a symbolic link, else a copy.  Returns
+    which ("there", "hard link", "symbolic link" or "copy")."""
+    if dst.exists() or dst.is_symlink():
+        if dst.exists() and dst.stat().st_size == src.stat().st_size:
+            return "there"
+        dst.unlink()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(src, dst)
+        return "hard link"
+    except OSError:
+        pass
+    try:
+        os.symlink(src.resolve(), dst)
+        return "symbolic link"
+    except OSError:
+        pass
+    need = src.stat().st_size / 1e9
+    if shutil.disk_usage(dst.parent).free / 1e9 < need + 3:
+        fail(f"not enough free space in {dst.parent} to copy {src.name} ({need:.0f} GB): it could not be linked",
+             "free some space, or put the models on one drive (--models-dir)")
+    shutil.copy2(src, dst)
+    return "copy"
+
+
+def ds4_share_step(plan: dict) -> Path:
+    """Puts the shared tables where the pack reads them (plan["folder"]) and says what was done."""
+    how = {share_file(p, plan["folder"] / n) for n, p in plan["src"].items()}
+    ok(f"the n-gram (Engram) tables: {plan['what']}; {'/'.join(sorted(how))} into {plan['folder']}"
+       + ("" if "copy" in how else " (no second copy of the 161 GB)"))
+    return plan["folder"]
+
+
 def ds4_kv_gb(ctx: int, gpus: int = 1) -> float:
     """GB of VRAM the context's caches take, on all the GPUs together (each holds its layers' caches, every member of
     a tensor-parallel group the group's: counted on each GPU - the upper bound)."""
@@ -5144,10 +5375,11 @@ def ds4_link_engram(d: Path, m: dict, models: Path, prev: dict):
             break
 
 
-def ds4_model_step(a, d: Path, m: dict):
+def ds4_model_step(a, d: Path, m: dict, announce: bool = True):
     """The model's files in d (downloaded when they are not there): their list, or None when nothing was
-    downloaded."""
-    step(5, f"the model ({DS4})")
+    downloaded.  announce=False: the step heading was printed already."""
+    if announce:
+        step(5, f"the model ({DS4})")
     files = [d / n for n in m["files"]]
     if any(file_incomplete(m, f) for f in files) and not offer_download(a, DS4, d, files, m):
         return None
@@ -5256,12 +5488,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         ok(f"the CPU lane's experts: --mmap-experts {a.mmap_experts}")
     if vision is None:                   # (a GGUF has none of its own: vision_pack.py's, when the pack has it)
         vision = quant in DS4_EXL3 or ds4_pack_has_vision(pack)
-    try:   # (the EXL3 quant's vision tower: not before RTX 30 / A100 - a V100 runs the model, text only)
-        ccs = [int(g["arch"]) for g in pc.get("gpus", [])]
-    except (TypeError, ValueError, KeyError):
-        ccs = []
-    if vision and quant in DS4_EXL3 and ccs and min(ccs) < DS4_VISION_MIN_CC:
-        vision = False
+    # (the EXL3 quant's tower is the same as the GGUF's - the checkpoint's vision.* in the pack, the same BF16 cuBLAS
+    #  GEMMs (src/ds4/ds4_vision.cu) - so it reads pictures on every GPU the model runs on, V100 included)
     if a.no_vision or not vision:
         args += ["--vision", "off"]
     if "--dspark" not in args[:-1] and CDS.has_drafter({"args": args}):
@@ -5348,7 +5576,15 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     if quant in DS4_ABL and not ds4_abl_engram_there(d, models):   # (the tables follow: room for them too)
         m = dict(m, also_gb=ds4_abl_engram_gb(), also_what="Maya's Q6_K n-gram tables, downloaded after it")
     old = ds4_earlier(m, d) if gguf else None          # (an earlier layout of the files, whole: used as it is)
-    files = ds4_model_step(a, d, old or m)             # 5
+    shared = None
+    look = gguf and old is None and quant not in DS4_ABL
+    if look:                                           # (its checks of the other model's tables print under the heading)
+        step(5, f"the model ({DS4})")
+        shared = ds4_shared_tables(quant, d, models, m)
+    if shared:                                         # (the same Q6_K tables are there: unsloth's UD-IQ3_S <-> Maya's)
+        ok(f"{shared['what']}: {(m['download_gb'] - shared['model']['download_gb']):.0f} GB less to download")
+        m = shared["model"]
+    files = ds4_model_step(a, d, old or m, announce=not look)             # 5
     if files is None:
         return None
     if gguf and old is None:
@@ -5362,12 +5598,14 @@ def set_up_ds4(a, prev: dict) -> Path | None:
         engram = ds4_abl_engram_step(a, d, models)
         if engram is None:
             return None
+    if shared:
+        engram, without = ds4_share_step(shared), shared["without"]
     drafter = gguf and ds4_drafter_step(a, d.parent / "dspark", quant)   # (the EXL3 quant has its own)
     own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
     dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
     pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
-        vision = ds4_vision_step(a, pc, d)
+        vision = ds4_vision_step(a, pc, d, mmproj=quant in DS4_UD)   # (UD quants: unsloth's mmproj, the same tower)
         if vision and not ds4_pack_has_vision(pack):
             pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without)
         vision = vision and ds4_pack_has_vision(pack)
@@ -5788,7 +6026,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     #  has them: a kept --vision on without a tower in the pack dropped)
     # (--tp: the config before's for the same GPUs only, else worked out again below from the GPUs chosen now - #436)
     keep = ("--chunk", "--staging", "--cpu-threads", "--reserve-gb", "--resident-cap", "--kv-cache", "--kv-streaming",
-            "--kv-resident", "--dspark", "--dspark-conf", "--vision", "--vision-gpu", "--parallel") + \
+            "--kv-resident", "--dspark", "--dspark-conf", "--vision-gpu", "--parallel") + \
         (() if gguf else (("--tp",) if tp_keepable(old, pc) else ()) + ("--cache-gb",))
     kept = keep_args(old.get("args") or [], args, keep)
     if getattr(a, "parallel", None):   # given now: written, and a later setup keeps it
@@ -5825,12 +6063,12 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # calibration (tools/calibrate_ds4.py, as DeepSeek's) or the user's choice says it pays (set_up_mm3)
     if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
         args += ["--dspark", "off"]
-    # pictures, ON by default: the pack's vision tower in the engine (in RAM, on a GPU only during a picture); --no-vision (or a
-    # config's --vision off, kept) frees it for experts
+    # pictures, ON by default: the pack's vision tower in the engine (in RAM, on a GPU only during a picture) - a setup
+    # again turns them on (a config's --vision off is not kept); --no-vision frees it for experts
     if getattr(a, "no_vision", False):
         set_arg(args, "--vision", "off")
-    elif "--vision" not in args[:-1] and mm3_pack_has_vision(pack):
-        args += ["--vision", "on"]
+    elif mm3_pack_has_vision(pack):
+        set_arg(args, "--vision", "on")
     if hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
         mib = hip_reserve_mib(pc["gpus"])
         set_arg(args, "--reserve-gb", f"{mib / 1024:.1f}")
@@ -6055,7 +6293,8 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path) -> Path:
     return pack
 
 
-def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int, models: Path, d: Path) -> Path:
+def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int, models: Path, d: Path,
+                      vision: dict | None = None) -> Path:
     """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD) and its start script.  A setup again keeps what the
     config before says that this one does not ask: its engine settings, the thinking level and sampling, where the
     server listens and its key."""
@@ -6075,13 +6314,16 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     # (the engine's server needs the MTP drafter loaded - the setup always builds it; drafting off is --mtp-max-t 1)
     if (pack / "mtp" / "dense.txt").exists():
         args += ["--mtp", str(pack / "mtp")]
+    if vision:                                         # (pictures: GENI requests, each image's rows at its pad tokens)
+        args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
                                                    "--experts-from-gguf"))
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
            "model_name": QWEN_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(QWEN_SAMPLING), "reasoning_effort": QWEN_EFFORT,   # (the model's own, every setup)
-           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
+           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
+           **({"vision": vision} if vision else {})}
     for k in ("host", "api_key", "cors_origins", "mcp_servers", "layer_split"):
         if old.get(k) is not None:
             cfg[k] = old[k]
@@ -6183,6 +6425,61 @@ def qwen_draft_calibration(cfg_path: Path) -> bool | None:
     return use
 
 
+def qwen_vision_model() -> dict | None:
+    """The model's vision tower as offer_download's form (tools/qwen/download.json's "vision": llama.cpp's mmproj of the
+    base model's tower, which the fine-tune left as it was), or None when the manifest names none."""
+    man = read_json(QWEN_MANIFEST).get("vision") or {}
+    if not man.get("files") or not man.get("repo") or not man.get("revision"):
+        return None
+    return {"about": f"{QWEN_SHOWN}'s vision tower (it lets the model read pictures): llama.cpp's mmproj of the base "
+                     "model Qwen3.8-Flash-Next's tower, the same weights", "format": "mmproj",
+            "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
+            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
+            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def vision_encoder_ready(a, pc: dict, meta: dict, llama: Path) -> bool:
+    """build-vision's maya-vision for this PC's GPUs, compiled when it is not there or its source changed."""
+    src = S.source_hash(("tools/vision",))
+    vmeta = read_json(VSTAMP)
+    if VEXE.exists() and not a.rebuild and vmeta.get("src") == src \
+            and set(meta.get("archs") or pc.get("archs") or []) <= set(vmeta.get("archs", [])):
+        return True
+    if compile_vision(pc, meta, llama, src):
+        return True
+    warn("the vision encoder did not compile (the reason is above): the model reads text only - "
+         f"{ME} --setup --rebuild tries again")
+    return False
+
+
+def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path) -> dict | None:
+    """Step 7: the config's "vision" entry - maya-vision with the model's mmproj (in <model folder>/vision) and the
+    GGUF's vocabulary - or None (text only, said why).  The server starts the encoder when a request carries a picture;
+    the engine places its rows at the <|image_pad|> tokens with their M-RoPE positions (--vision: GENI requests)."""
+    step(7, "images (the vision encoder)")
+    if a.no_vision:
+        ok("skipped (--no-vision): the model reads text only")
+        return None
+    m = qwen_vision_model()
+    if m is None:
+        warn(f"{QWEN_MANIFEST} names no vision tower: the model reads text only")
+        return None
+    vd = d / "vision"
+    files = [vd / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the vision tower", vd, files, m):
+        warn(f"the vision tower was not downloaded: the model reads text only ({ME} --setup asks again)")
+        return None
+    for f in files:                                    # (offer_download checked the ones it fetched; these too)
+        if not sha256_checked(f, m["sha256"][f.name]):
+            f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
+            fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
+    if not vision_encoder_ready(a, pc, meta, llama):
+        return None
+    ok(f"pictures: ON - the vision encoder {VEXE} with {files[0].name} ({m['download_gb']:.1f} GB on the SSD); it "
+       "starts only when a picture arrives, no VRAM kept for it")
+    return {"exe": str(VEXE), "mmproj": str(files[0]), "model": str(gguf), "gpu": True}
+
+
 def set_up_qwen(a, prev: dict) -> Path | None:
     """CYBER-FROST-3.8-PS's steps 1-8: the PC (NVIDIA from V100, or AMD), the context (recommended by this PC's VRAM),
     the engine (build/maya), the file (pinned, sha256-checked), the pack and the MTP drafter, the config; then the
@@ -6214,9 +6511,8 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     if files is None:
         return None
     pack = qwen_pack_step(a, d, files, llama)          # 6
-    step(7, "images")                                  # 7
-    ok("pictures: none - the model has no vision tower (text only)")
-    cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d)   # 8
+    vision = qwen_vision_step(a, pc, meta, llama, d, files[0])   # 7
+    cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d, vision)   # 8
     if "mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate:
         how = drafting_choice(a, "the MTP drafter", "10-40")
         if how != "measure":
@@ -6313,7 +6609,9 @@ def main() -> int:
                     help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
                          "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "
                          "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
-                         "(dense weights Q8_0: less VRAM; chosen by hand only, not in the setup's list), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
+                         "(dense weights Q8_0: less VRAM; chosen by hand only, not in the setup's list), gguf-iq1_s / gguf-iq1_m / "
+                         "gguf-iq2_xxs / gguf-q2_k_xl / gguf-iq3_xxs / gguf-iq3_s / gguf-q3_k_xl = its smaller UD quants (experts "
+                         "1.6-3.5 bits; chosen by hand too), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
                          "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, AMD experimental); "
                          "abliterated-128g / abliterated-256g = orcarouter's abliterated model (its refusals removed) "
                          "as its Mix-128G / Mix-256G GGUF (~114 / ~236 GB of VRAM + RAM, with Maya's Q6_K n-gram "
